@@ -1,0 +1,9 @@
+services:
+  core:
+    networks:
+      - backend
+      - exchange_egress
+
+networks:
+  exchange_egress:
+    driver: bridge

@@ -1,0 +1,97 @@
+name: trading-bot-demo
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: trading_demo
+      POSTGRES_USER: bootstrap_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: UTC
+
+    secrets:
+      - postgres_password
+      - core_db_password
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database:/docker-entrypoint-initdb.d:ro
+      - ./migrations:/migrations:ro
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U bootstrap_admin -d trading_demo
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+    networks:
+      - backend
+
+  core:
+    build:
+      context: ./core
+
+    restart: unless-stopped
+
+    environment:
+      DB_HOST: postgres
+      DB_NAME: trading_demo
+      TZ: UTC
+
+    secrets:
+      - core_db_password
+      - core_api_token
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    ports:
+      - "127.0.0.1:8080:8000"
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).close()"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    networks:
+      - backend
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+
+  core_db_password:
+    file: ./secrets/core_db_password.txt
+
+  core_api_token:
+    file: ./secrets/core_api_token.txt
+
+volumes:
+  postgres_data:
+
+networks:
+  backend:
+    internal: true
