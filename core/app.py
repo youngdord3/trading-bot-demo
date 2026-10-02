@@ -1,11 +1,15 @@
 import hmac
 import json
 import os
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
+
+from binance_private import PrivateReadError, ReadOnlyClient
 
 def read_secret(name: str) -> str:
     value = Path(f"/run/secrets/{name}").read_text(
@@ -111,6 +115,40 @@ def read_database_status() -> dict:
         "trading_ready": False,
     }
 
+EXCHANGE_CACHE_TTL_SECONDS = 10.0
+_exchange_lock = threading.Lock()
+_exchange_last_check = 0.0
+_exchange_connected_cached = False
+
+def check_exchange_connected() -> bool:
+    global _exchange_last_check, _exchange_connected_cached
+    now = time.monotonic()
+    with _exchange_lock:
+        if (now - _exchange_last_check) < EXCHANGE_CACHE_TTL_SECONDS:
+            return _exchange_connected_cached
+
+        connected = False
+        try:
+            client = ReadOnlyClient()
+            data = client.get("/fapi/v3/account")
+            if isinstance(data, dict) and "totalMarginBalance" in data:
+                connected = True
+        except Exception:
+            connected = False
+
+        _exchange_last_check = time.monotonic()
+        _exchange_connected_cached = connected
+        return _exchange_connected_cached
+
+def read_readiness_status() -> dict:
+    payload = read_database_status()
+    exchange_connected = check_exchange_connected()
+    payload["exchange_connected"] = exchange_connected
+    payload["checks"]["exchange_connected"] = exchange_connected
+    payload["ready"] = bool(payload["ready"] and exchange_connected)
+    payload["trading_ready"] = False
+    return payload
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "TradingCore"
     sys_version = ""
@@ -163,14 +201,14 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            payload = read_database_status()
+            payload = read_readiness_status()
         except Exception:
-            # Do not expose database errors or credentials.
+            # Do not expose internal errors or credentials.
             self.send_json(
                 503,
                 {
                     "ready": False,
-                    "error": "DATABASE_CHECK_FAILED",
+                    "error": "READINESS_CHECK_FAILED",
                     "trading_ready": False,
                 },
             )
@@ -192,8 +230,8 @@ if __name__ == "__main__":
     server.daemon_threads = True
 
     print(
-        "Trading Core started: DATABASE_READ_ONLY; "
-        "no exchange connector; no order endpoints.",
+        "Trading Core started: READ_ONLY; "
+        "Binance Futures read-only connector enabled; no order endpoints.",
         flush=True,
     )
 

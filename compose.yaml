@@ -46,6 +46,8 @@ services:
     secrets:
       - core_db_password
       - core_api_token
+      - binance_api_key
+      - binance_api_secret
 
     depends_on:
       postgres:
@@ -88,6 +90,12 @@ secrets:
 
   core_api_token:
     file: ./secrets/core_api_token.txt
+
+  binance_api_key:
+    file: ./secrets/binance_api_key.txt
+
+  binance_api_secret:
+    file: ./secrets/binance_api_secret.txt
 
 volumes:
   postgres_data:
