@@ -14,6 +14,7 @@ services:
     secrets:
       - postgres_password
       - core_db_password
+      - core_reconciler_db_password
 
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -45,6 +46,7 @@ services:
 
     secrets:
       - core_db_password
+      - core_reconciler_db_password
       - core_api_token
       - binance_api_key
       - binance_api_secret
@@ -96,6 +98,9 @@ secrets:
 
   binance_api_secret:
     file: ./secrets/binance_api_secret.txt
+
+  core_reconciler_db_password:
+    file: ./secrets/core_reconciler_db_password.txt
 
 volumes:
   postgres_data:
