@@ -87,7 +87,7 @@ def read_database_status() -> dict:
         "demo_environment": state["environment"] == "DEMO",
         "paused": state["status"] == "PAUSED",
         "orders_disabled": state["orders_enabled"] is False,
-        "expected_schema": migrations == [1, 2, 3],
+        "expected_schema": migrations == [1, 2, 3, 4],
         "restricted_db_user": (
             permissions["db_user"] == DB_USER
         ),
