@@ -32,7 +32,8 @@ def _read_secret(name):
     return value
 
 class ReadOnlyClient:
-    def __init__(self):
+    def __init__(self, time_offset_ms: int = 0):
+        self._time_offset_ms = time_offset_ms
         self._key = _read_secret("binance_api_key")
         self._secret = _read_secret("binance_api_secret").encode("utf-8")
         self._ctx = ssl.create_default_context()
@@ -44,7 +45,7 @@ class ReadOnlyClient:
 
         query = dict(params or {})
         query["recvWindow"] = RECV_WINDOW_MS
-        query["timestamp"] = int(time.time() * 1000)  # fresco a ogni chiamata
+        query["timestamp"] = int(time.time() * 1000) + self._time_offset_ms  # fresco a ogni chiamata
         encoded = urlencode(query)
         signature = hmac.new(
             self._secret, encoded.encode("utf-8"), hashlib.sha256
