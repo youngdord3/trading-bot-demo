@@ -1,0 +1,36 @@
+services:
+  paper-trader:
+    build:
+      context: ./core
+    image: trading-bot-demo-core
+    command: ["python", "-u", "paper_trader.py"]
+    restart: on-failure
+    init: true
+    user: "10001:10001"
+
+    environment:
+      DB_HOST: postgres
+      DB_NAME: trading_demo
+      TZ: UTC
+
+    secrets:
+      - core_paper_trader_db_password
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - backend
+      - exchange_egress

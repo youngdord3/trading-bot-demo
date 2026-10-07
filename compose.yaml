@@ -49,8 +49,6 @@ services:
     secrets:
       - core_db_password
       - core_reconciler_db_password
-      - corepapertraderdbpassword
-      - core_paper_trader_db_password
       - core_api_token
       - binance_api_key
       - binance_api_secret
