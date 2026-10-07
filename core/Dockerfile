@@ -12,8 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home app
 
-COPY --chown=app:app app.py check_binance_public.py binance_private.py check_binance_account.py ./
-COPY --chown=app:app check_reconciler_db.py ./
+COPY --chown=app:app app.py binance_private.py ./
+COPY --chown=app:app check_binance_public.py check_binance_account.py check_reconciler_db.py reconciler.py ./
 
 USER app
 
