@@ -15,10 +15,12 @@ ALLOWED_PATHS = frozenset({
     "/fapi/v1/exchangeInfo",
     "/fapi/v1/klines",
     "/fapi/v1/ticker/price",
+    "/fapi/v1/fundingRate",
 })
 TIMEOUT_S = 10
 MAX_RESPONSE_BYTES = 8_000_000   # exchangeInfo è grande
 MAX_KLINES_LIMIT = 1500
+MAX_FUNDING_LIMIT = 1000
 
 
 class PublicAPIError(Exception):
@@ -117,24 +119,62 @@ class PublicClient:
                 return price
         raise PublicAPIError("INVALID_PRICE_RESPONSE")
 
-    def load_filters(self, symbol: str) -> MarketFilters:
+    def get_funding_rates(self, symbol: str, limit: int = 10,
+                          start_time_ms: int | None = None) -> list[tuple[int, Decimal]]:
+        """Scarica lo storico funding rate pubblico ordinato cronologicamente."""
+        if not 1 <= limit <= MAX_FUNDING_LIMIT:
+            raise PublicAPIError("INVALID_LIMIT")
+        params: dict[str, str | int] = {"symbol": symbol, "limit": limit}
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        data = self.get("/fapi/v1/fundingRate", params)
+        if not isinstance(data, list):
+            raise PublicAPIError("INVALID_FUNDING_RESPONSE")
+        out: list[tuple[int, Decimal]] = []
+        for item in data:
+            if not isinstance(item, dict) or type(item.get("fundingTime")) is not int:
+                raise PublicAPIError("INVALID_FUNDING_RESPONSE")
+            try:
+                rate = Decimal(str(item["fundingRate"]))
+            except (KeyError, ArithmeticError):
+                raise PublicAPIError("INVALID_FUNDING_RESPONSE") from None
+            out.append((item["fundingTime"], rate))
+        out.sort(key=lambda x: x[0])
+        return out
+
+    def load_filters_many(self, symbols: list[str]) -> dict[str, MarketFilters]:
+        """Carica e valida i filtri di exchange per piu' simboli in una sola chiamata."""
         data = self.get("/fapi/v1/exchangeInfo")
-        symbols = data.get("symbols", []) if isinstance(data, dict) else []
-        matches = [s for s in symbols if isinstance(s, dict) and s.get("symbol") == symbol]
-        if len(matches) != 1:
-            raise PublicAPIError("SYMBOL_NOT_UNIQUE")
-        s = matches[0]
-        if s.get("status") != "TRADING" or s.get("contractType") != "PERPETUAL":
-            raise PublicAPIError("SYMBOL_NOT_TRADABLE")
-        f = {x["filterType"]: x for x in s.get("filters", [])
-             if isinstance(x, dict) and "filterType" in x}
-        try:
-            return MarketFilters(
-                tick_size=Decimal(f["PRICE_FILTER"]["tickSize"]),
-                market_step_size=Decimal(f["MARKET_LOT_SIZE"]["stepSize"]),
-                market_min_qty=Decimal(f["MARKET_LOT_SIZE"]["minQty"]),
-                market_max_qty=Decimal(f["MARKET_LOT_SIZE"]["maxQty"]),
-                min_notional=Decimal(f["MIN_NOTIONAL"]["notional"]),
-            )
-        except (KeyError, ArithmeticError):
-            raise PublicAPIError("FILTERS_INCOMPLETE") from None
+        entries = data.get("symbols", []) if isinstance(data, dict) else []
+        by_symbol: dict[str, list[dict]] = {sym: [] for sym in symbols}
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("symbol") in by_symbol:
+                by_symbol[entry["symbol"]].append(entry)
+        out: dict[str, MarketFilters] = {}
+        for sym in symbols:
+            matches = by_symbol[sym]
+            if len(matches) != 1:
+                raise PublicAPIError("SYMBOL_NOT_UNIQUE")
+            out[sym] = _parse_symbol_filters(matches[0])
+        return out
+
+    def load_filters(self, symbol: str) -> MarketFilters:
+        return self.load_filters_many([symbol])[symbol]
+
+
+def _parse_symbol_filters(s: dict) -> MarketFilters:
+    """Valida stato perpetual ed estrae i filtri numerici di un simbolo."""
+    if s.get("status") != "TRADING" or s.get("contractType") != "PERPETUAL":
+        raise PublicAPIError("SYMBOL_NOT_TRADABLE")
+    f = {x["filterType"]: x for x in s.get("filters", [])
+         if isinstance(x, dict) and "filterType" in x}
+    try:
+        return MarketFilters(
+            tick_size=Decimal(f["PRICE_FILTER"]["tickSize"]),
+            market_step_size=Decimal(f["MARKET_LOT_SIZE"]["stepSize"]),
+            market_min_qty=Decimal(f["MARKET_LOT_SIZE"]["minQty"]),
+            market_max_qty=Decimal(f["MARKET_LOT_SIZE"]["maxQty"]),
+            min_notional=Decimal(f["MIN_NOTIONAL"]["notional"]),
+        )
+    except (KeyError, ArithmeticError):
+        raise PublicAPIError("FILTERS_INCOMPLETE") from None

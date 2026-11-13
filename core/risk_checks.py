@@ -26,6 +26,8 @@ class RiskLimits:
     max_open_positions: int = 1
     max_daily_loss_usdt: Decimal = Decimal("100")
     notional_buffer: Decimal = Decimal("1.10")   # margine sopra il min_notional
+    enforce_btc_qty_cap: bool = True
+    max_quantity: Decimal | None = None
 
 
 class RiskViolation(Exception):
@@ -66,13 +68,42 @@ def size_open_quantity(price: Decimal, f: MarketFilters, limits: RiskLimits) -> 
     return ceil_to_step(max(target, f.market_min_qty), f.market_step_size)
 
 
+def size_open_quantity_atr(
+    equity_usdt: Decimal,
+    risk_fraction: Decimal,
+    stop_distance: Decimal,
+    price: Decimal,
+    f: MarketFilters,
+    limits: RiskLimits,
+) -> Decimal:
+    """Calcola la quantita' su rischio ATR fisso (e.g. 1% equity / 1.5*ATR), arrotondata per difetto."""
+    if equity_usdt <= 0 or risk_fraction <= 0:
+        raise RiskViolation("INVALID_RISK_BUDGET")
+    if stop_distance <= 0:
+        raise RiskViolation("INVALID_STOP_DISTANCE")
+    if price <= 0:
+        raise RiskViolation("INVALID_PRICE")
+    risk_usdt = equity_usdt * risk_fraction
+    caps = [risk_usdt / stop_distance, limits.max_notional_usdt / price, f.market_max_qty]
+    if limits.enforce_btc_qty_cap:
+        caps.append(limits.max_quantity_btc)
+    if limits.max_quantity is not None:
+        caps.append(limits.max_quantity)
+    qty = floor_to_step(min(caps), f.market_step_size)
+    if qty < f.market_min_qty or qty * price < f.min_notional:
+        raise RiskViolation(f"BELOW_MIN_NOTIONAL_OR_QTY: qty={qty}, notional={qty * price}")
+    return qty
+
+
 def validate_open(qty: Decimal, price: Decimal, f: MarketFilters, limits: RiskLimits,
                   open_positions: int, daily_net_pnl_usdt: Decimal) -> dict:
     if qty != floor_to_step(qty, f.market_step_size):
         raise RiskViolation(f"QTY_NOT_ON_STEP: {qty}")
     if not f.market_min_qty <= qty <= f.market_max_qty:
         raise RiskViolation(f"QTY_OUT_OF_EXCHANGE_RANGE: {qty}")
-    if qty > limits.max_quantity_btc:
+    if limits.enforce_btc_qty_cap and qty > limits.max_quantity_btc:
+        raise RiskViolation(f"ABOVE_RISK_MAX_QTY: {qty}")
+    if limits.max_quantity is not None and qty > limits.max_quantity:
         raise RiskViolation(f"ABOVE_RISK_MAX_QTY: {qty}")
     notional = qty * price
     if notional < f.min_notional:
