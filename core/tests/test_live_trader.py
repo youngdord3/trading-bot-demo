@@ -4,8 +4,8 @@ import unittest
 from decimal import Decimal as D
 
 from binance_public import MarketFilters
-from order_executor import OrderExecutor, TradeClient
-from strategy import STRATEGY_REASON, TsmomParams, UNIVERSE_SYMBOLS
+from order_executor import OrderExecutor, TradeClient, quantize_stop_price
+from strategy import STRATEGY_REASON, Signal, TsmomParams, UNIVERSE_SYMBOLS, evaluate_tsmom_erf, parse_closed_candles
 import live_trader as lt
 
 BTC_F = MarketFilters(D("0.1"), D("0.001"), D("0.001"), D("120"), D("100"))
@@ -32,6 +32,66 @@ def _make_trending_raw_klines(n=221, start_open_ms=1_700_000_000_000, step_ms=86
             c = price + 3.0
             h = c + 0.5
             l = o - 0.2
+            price = c
+        rows.append([ot, f"{o:.4f}", f"{h:.4f}", f"{l:.4f}", f"{c:.4f}", "1000", ct])
+    return rows
+
+
+def _make_downtrend_raw_klines(n=221, start_open_ms=1_700_000_000_000, step_ms=86_400_000, wobble=0.0):
+    rows = []
+    price = 1000.0
+    for i in range(n):
+        ot = start_open_ms + i * step_ms
+        ct = ot + step_ms - 1
+        if i < n - 45:
+            o = price
+            c = price - 0.05
+            h = o + 0.3
+            l = c - 0.4
+            price = c
+        else:
+            step = -3.0 + (wobble if (n - 12 <= i < n - 3 and i % 2 == 1) else 0.0)
+            o = price
+            c = price + step
+            h = max(o, c) + 0.2
+            l = min(o, c) - 0.2
+            price = c
+        rows.append([ot, f"{o:.4f}", f"{h:.4f}", f"{l:.4f}", f"{c:.4f}", "1000", ct])
+    return rows
+
+
+def _make_custom_uptrend_raw_klines(
+    n=221,
+    start_open_ms=1_700_000_000_000,
+    step_ms=86_400_000,
+    base_price=100.0,
+    trend_step=3.0,
+    wick=0.2,
+    wobble=0.0,
+):
+    """Genera serie rialzista controllata per testare er10 diversi e ATR basso (cap 2.0*equity)."""
+    rows = []
+    price = base_price
+    for i in range(n):
+        ot = start_open_ms + i * step_ms
+        ct = ot + step_ms - 1
+        if i < n - 45:
+            o = price
+            c = price + 0.05
+            h = c + wick
+            l = o - wick
+            price = c
+        else:
+            # Piccola oscillazione nella finestra finale (-11..-4) riduce ER10 mantenendo il breakout finale
+            step = trend_step
+            if wobble and (n - 11 <= i <= n - 4):
+                step = trend_step - wobble if i % 2 == 0 else -(wobble * 0.6)
+            elif i == n - 2 and wobble:
+                step = trend_step * 1.15
+            o = price
+            c = price + step
+            h = max(o, c) + wick
+            l = min(o, c) - wick
             price = c
         rows.append([ot, f"{o:.4f}", f"{h:.4f}", f"{l:.4f}", f"{c:.4f}", "1000", ct])
     return rows
@@ -78,11 +138,12 @@ class FakePublicClient:
 
 
 class FakeReadClient:
-    def __init__(self, equity="5816.60", dual=False, sym_configs=None):
+    def __init__(self, equity="5816.60", dual=False, sym_configs=None, available_balance=None):
         self.equity = equity
         self.dual = dual
+        self.available_balance = available_balance
         self.sym_configs = sym_configs if sym_configs is not None else [
-            {"symbol": s, "marginType": "ISOLATED", "leverage": 2}
+            {"symbol": s, "marginType": "ISOLATED", "leverage": 7}
             for s in UNIVERSE_SYMBOLS
         ]
         self.sync_calls = 0
@@ -93,7 +154,10 @@ class FakeReadClient:
 
     def get(self, path, params=None):
         if path == "/fapi/v3/account":
-            return {"totalMarginBalance": self.equity}
+            out = {"totalMarginBalance": self.equity}
+            if self.available_balance is not None:
+                out["availableBalance"] = self.available_balance
+            return out
         if path == "/fapi/v1/positionSide/dual":
             return {"dualSidePosition": self.dual}
         if path == "/fapi/v1/symbolConfig":
@@ -102,10 +166,11 @@ class FakeReadClient:
 
 
 class FakeLiveTradeClient(TradeClient):
-    def __init__(self):
+    def __init__(self, avg_price_by_symbol=None):
         super().__init__(api_key="k" * 20, api_secret="s" * 32, time_offset_ms=0)
         self.requests = []
         self.algo_status_by_id = {}
+        self.avg_price_by_symbol = avg_price_by_symbol or {}
 
     def sync_time_offset(self):
         return 29780
@@ -118,7 +183,10 @@ class FakeLiveTradeClient(TradeClient):
         if (method, path) == ("POST", "/fapi/v1/leverage"):
             return {"symbol": p["symbol"], "leverage": p["leverage"]}
         if (method, path) == ("POST", "/fapi/v1/order"):
-            avg = "90000.0" if p["symbol"] == "BTCUSDT" else "244.0"
+            avg = self.avg_price_by_symbol.get(
+                p["symbol"],
+                "90000.0" if p["symbol"] == "BTCUSDT" else "244.0",
+            )
             return {
                 "orderId": 1000 + len(self.requests),
                 "clientOrderId": p["newClientOrderId"],
@@ -306,21 +374,26 @@ class FakeLiveConn:
 
 
 class TestLiveTrader(unittest.TestCase):
-    def test_preflight_sets_only_non_matching_symbols_to_isolated_2x(self):
-        sym_cfg = [{"symbol": s, "marginType": "ISOLATED", "leverage": 2} for s in UNIVERSE_SYMBOLS]
+    def test_preflight_sets_only_non_matching_symbols_to_isolated_7x(self):
+        sym_cfg = [{"symbol": s, "marginType": "ISOLATED", "leverage": 7} for s in UNIVERSE_SYMBOLS]
         sym_cfg[1]["marginType"] = "CROSSED"
         sym_cfg[1]["leverage"] = 20
         sym_cfg[5]["leverage"] = 10
 
         read_client = FakeReadClient(sym_configs=sym_cfg)
         trade_client = FakeLiveTradeClient()
-        res = lt.ensure_account_preflight(read_client, trade_client, UNIVERSE_SYMBOLS, target_leverage=2)
+        res = lt.ensure_account_preflight(read_client, trade_client, UNIVERSE_SYMBOLS, target_leverage=7)
         self.assertEqual(res["margin_updated"], [UNIVERSE_SYMBOLS[1]])
         self.assertEqual(res["leverage_updated"], [UNIVERSE_SYMBOLS[1], UNIVERSE_SYMBOLS[5]])
 
+        # Leva 2x deve essere rifiutata se i limiti V2 prevedono fino a 3 * 2.0 * equity (6.0x)
+        with self.assertRaises(lt.FatalError) as low_lev_ctx:
+            lt.ensure_account_preflight(read_client, trade_client, UNIVERSE_SYMBOLS, target_leverage=2)
+        self.assertIn("INSUFFICIENT_LEVERAGE_FOR_COMBINED_EXPOSURE", str(low_lev_ctx.exception))
+
         read_hedge = FakeReadClient(dual=True)
         with self.assertRaises(lt.FatalError):
-            lt.ensure_account_preflight(read_hedge, trade_client, UNIVERSE_SYMBOLS, target_leverage=2)
+            lt.ensure_account_preflight(read_hedge, trade_client, UNIVERSE_SYMBOLS, target_leverage=7)
 
     def test_paused_blocks_new_entries_and_still_syncs_triggered_algo_stop(self):
         raw = _make_trending_raw_klines()
@@ -350,11 +423,13 @@ class TestLiveTrader(unittest.TestCase):
         self.assertEqual(conn.orders[-1]["order_kind"], "STOP_MARKET")
         self.assertEqual(pub.klines_calls, 0)  # PAUSED non scarica neppure candele inutili
 
-    def test_active_cycle_sizes_from_real_equity_opens_position_and_respects_max_concurrent(self):
-        raw = _make_trending_raw_klines()
-        last_closed_close_ms = raw[-2][6]
+    def test_active_cycle_sizes_from_real_equity_opens_position_and_respects_max_same_side_and_concurrent(self):
+        raw_long = _make_trending_raw_klines()
+        raw_short = _make_downtrend_raw_klines()
+        last_closed_close_ms = raw_long[-2][6]
         syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-        raw_map = {s: list(raw) for s in syms}
+        # 4 segnali LONG identici -> MAX_SAME_SIDE_POSITIONS = 2 ne apre solo 2
+        raw_map = {s: list(raw_long) for s in syms}
         pub = FakePublicClient(server_now_ms=last_closed_close_ms + 15_000, raw_klines_by_sym=raw_map)
         market = lt.LiveMarket(symbols=syms, public_client=pub)
         market.refresh()
@@ -366,13 +441,27 @@ class TestLiveTrader(unittest.TestCase):
 
         processed = lt.process_cycle(conn, market, read_client, executor)
         self.assertTrue(processed)
-        # max_open_positions = 3 su 4 simboli con segnale BUY
-        self.assertEqual(len(conn.live_positions), 3)
-        self.assertEqual(set(conn.live_positions.keys()), {"BTCUSDT", "ETHUSDT", "SOLUSDT"})
-        # Tutte le posizioni hanno stop_algo_id protettivo registrato
+        self.assertEqual(len(conn.live_positions), 2)
+        self.assertEqual(set(conn.live_positions.keys()), {"BTCUSDT", "ETHUSDT"})
         for pos in conn.live_positions.values():
             self.assertIsNotNone(pos["stop_algo_id"])
             self.assertEqual(pos["stop_algo_status"], "NEW")
+
+        # Aggiungendo un segnale SHORT su SOLUSDT nella direzione opposta si arriva a max_open_positions = 3
+        raw_map_mix = {
+            "BTCUSDT": list(raw_long),
+            "ETHUSDT": list(raw_long),
+            "SOLUSDT": list(raw_short),
+            "XRPUSDT": list(raw_short),
+        }
+        pub_mix = FakePublicClient(server_now_ms=last_closed_close_ms + 15_000, raw_klines_by_sym=raw_map_mix)
+        market_mix = lt.LiveMarket(symbols=syms, public_client=pub_mix)
+        market_mix.refresh()
+        conn_mix = FakeLiveConn(status="ACTIVE", orders_enabled=True)
+        processed_mix = lt.process_cycle(conn_mix, market_mix, FakeReadClient(equity="5816.60"), OrderExecutor(FakeLiveTradeClient(), TsmomParams()))
+        self.assertTrue(processed_mix)
+        self.assertEqual(len(conn_mix.live_positions), 3)
+        self.assertEqual(set(conn_mix.live_positions.keys()), {"BTCUSDT", "ETHUSDT", "SOLUSDT"})
 
     def test_open_position_tightens_stop_and_closes_when_stop_hit_on_closed_candle(self):
         raw = _make_trending_raw_klines()
@@ -469,6 +558,251 @@ class TestLiveTrader(unittest.TestCase):
         methods_paths = [(m, p) for m, p, _ in trade_client.requests]
         self.assertIn(("DELETE", "/fapi/v1/algoOrder"), methods_paths)
         self.assertIn(("POST", "/fapi/v1/algoOrder"), methods_paths)
+
+    def test_restart_persists_initial_stop_price_and_1R_for_profit_ratchet_never_widens(self):
+        base_raw = _make_custom_uptrend_raw_klines(n=225, base_price=100.0, trend_step=3.0, wick=0.2)
+        entry_close_str = base_raw[220][4]
+        pub1 = FakePublicClient(
+            server_now_ms=base_raw[220][6] + 10_000,
+            raw_klines_by_sym={"ETHUSDT": base_raw[:222]},
+        )
+        m1 = lt.LiveMarket(symbols=["ETHUSDT"], public_client=pub1)
+        m1.refresh()
+
+        conn = FakeLiveConn(status="ACTIVE", orders_enabled=True)
+        tc1 = FakeLiveTradeClient(avg_price_by_symbol={"ETHUSDT": entry_close_str})
+        rc = FakeReadClient(equity="5816.60")
+        self.assertTrue(lt.process_cycle(conn, m1, rc, OrderExecutor(tc1, TsmomParams())))
+
+        pos = conn.live_positions["ETHUSDT"]
+        entry = pos["entry_price"]
+        init_stop = D(pos["risk_checks"]["initial_stop_price"])
+        r1 = D(pos["risk_checks"]["initial_risk_distance"])
+        trail_dist = pos["trail_distance"]
+        self.assertGreater(r1, D("0"))
+        self.assertEqual(r1, abs(entry - init_stop))
+        self.assertEqual(pos["stop_price"], init_stop)
+
+        # Barra 221: tocca +2.5R -> ratchet 0.80x; initial_stop_price e 1R restano immutabili
+        best_25r = entry + D("2.5") * r1
+        bar_221 = list(base_raw[221])
+        bar_221[2] = f"{best_25r:.4f}"
+        bar_221[3] = f"{entry + D('0.5'):.4f}"
+        bar_221[4] = f"{entry + D('2.0') * r1:.4f}"
+        raw_step2 = base_raw[:221] + [bar_221, base_raw[222]]
+        pub2 = FakePublicClient(server_now_ms=bar_221[6] + 10_000, raw_klines_by_sym={"ETHUSDT": raw_step2})
+        m2 = lt.LiveMarket(symbols=["ETHUSDT"], public_client=pub2)
+        m2.refresh()
+        self.assertTrue(lt.process_cycle(conn, m2, rc, OrderExecutor(tc1, TsmomParams())))
+
+        expected_stop_25r = quantize_stop_price("LONG", best_25r - D("0.80") * trail_dist, ETH_F.tick_size)
+        self.assertEqual(pos["stop_price"], expected_stop_25r)
+        self.assertEqual(D(pos["risk_checks"]["initial_stop_price"]), init_stop)
+        self.assertEqual(D(pos["risk_checks"]["initial_risk_distance"]), r1)
+
+        # Simula RESTART completo (nuovo Market + nuovo OrderExecutor, solo DB persistito)
+        # Barra 222: pullback con high < best_25r e low > stop -> lo stop NON deve allargarsi
+        bar_222 = list(base_raw[222])
+        bar_222[2] = f"{entry + D('1.5') * r1:.4f}"
+        bar_222[3] = f"{expected_stop_25r + D('0.5'):.4f}"
+        bar_222[4] = f"{entry + D('1.2') * r1:.4f}"
+        raw_step3 = raw_step2[:-1] + [bar_222, base_raw[223]]
+        pub3 = FakePublicClient(server_now_ms=bar_222[6] + 10_000, raw_klines_by_sym={"ETHUSDT": raw_step3})
+        m3 = lt.LiveMarket(symbols=["ETHUSDT"], public_client=pub3)
+        m3.refresh()
+        tc2 = FakeLiveTradeClient(avg_price_by_symbol={"ETHUSDT": entry_close_str})
+        lt.process_cycle(conn, m3, rc, OrderExecutor(tc2, TsmomParams()))
+        self.assertEqual(conn.live_positions["ETHUSDT"]["stop_price"], expected_stop_25r)
+
+        # Barra 223 post-restart: tocca +4.0R su 1R iniziale -> ratchet 0.60x
+        best_40r = entry + D("4.0") * r1
+        bar_223 = list(base_raw[223])
+        bar_223[2] = f"{best_40r:.4f}"
+        bar_223[3] = f"{expected_stop_25r + D('1.0'):.4f}"
+        bar_223[4] = f"{entry + D('3.5') * r1:.4f}"
+        raw_step4 = raw_step3[:-1] + [bar_223, base_raw[224]]
+        pub4 = FakePublicClient(server_now_ms=bar_223[6] + 10_000, raw_klines_by_sym={"ETHUSDT": raw_step4})
+        m4 = lt.LiveMarket(symbols=["ETHUSDT"], public_client=pub4)
+        m4.refresh()
+        lt.process_cycle(conn, m4, rc, OrderExecutor(tc2, TsmomParams()))
+        expected_stop_40r = quantize_stop_price("LONG", best_40r - D("0.60") * trail_dist, ETH_F.tick_size)
+        self.assertEqual(conn.live_positions["ETHUSDT"]["stop_price"], expected_stop_40r)
+        self.assertGreater(expected_stop_40r, expected_stop_25r)
+
+    def test_0000_utc_cycle_order_exits_first_updates_side_counts_then_sorted_er10_entries(self):
+        raw_btc = _make_custom_uptrend_raw_klines(n=221, base_price=80000.0, trend_step=200.0, wick=100.0)
+        raw_eth = _make_custom_uptrend_raw_klines(n=221, base_price=200.0, trend_step=2.0, wick=0.2)
+        prev_bar = raw_btc[-3]
+        # BTCUSDT viola lo stop LONG (87000) sulla candela chiusa 00:00 UTC -> deve chiudersi in Step 1
+        raw_btc[-2][3] = "86000.0"
+        raw_btc[-2][4] = "86500.0"
+        raw_eth[-2][3] = "210.0"
+
+        raw_sol = _make_custom_uptrend_raw_klines(n=221, base_price=100.0, trend_step=3.0, wick=0.2, wobble=1.8)
+        raw_doge = _make_custom_uptrend_raw_klines(n=221, base_price=100.0, trend_step=3.0, wick=0.2, wobble=1.95)
+        raw_avax = _make_custom_uptrend_raw_klines(n=221, base_price=100.0, trend_step=3.0, wick=0.2, wobble=0.0)
+
+        now_ms = raw_btc[-2][6] + 10_000
+        # Verifica prerequisito: tutti e 3 i candidati flat danno BUY con avax.er10 > sol.er10
+        ev_avax = evaluate_tsmom_erf(parse_closed_candles(raw_avax, now_ms, 86_400_000), [], TsmomParams())
+        ev_sol = evaluate_tsmom_erf(parse_closed_candles(raw_sol, now_ms, 86_400_000), [], TsmomParams())
+        ev_doge = evaluate_tsmom_erf(parse_closed_candles(raw_doge, now_ms, 86_400_000), [], TsmomParams())
+        self.assertEqual((ev_avax.signal, ev_sol.signal, ev_doge.signal), (Signal.BUY, Signal.BUY, Signal.BUY))
+        self.assertGreater(ev_avax.er10, ev_sol.er10)
+
+        syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "AVAXUSDT"]
+        pub = FakePublicClient(
+            server_now_ms=now_ms,
+            raw_klines_by_sym={
+                "BTCUSDT": raw_btc, "ETHUSDT": raw_eth, "SOLUSDT": raw_sol,
+                "DOGEUSDT": raw_doge, "AVAXUSDT": raw_avax,
+            },
+        )
+        market = lt.LiveMarket(symbols=syms, public_client=pub)
+        market.refresh()
+
+        conn = FakeLiveConn(status="ACTIVE", orders_enabled=True)
+        for s, pb in (("BTCUSDT", raw_btc[-3]), ("ETHUSDT", raw_eth[-3])):
+            conn.processed_candles[(s, "1d", pb[0])] = ("BUY", D(pb[4]))
+        conn.live_positions["BTCUSDT"] = {
+            "symbol": "BTCUSDT", "side": "LONG", "quantity": D("0.02"), "entry_price": D("89000"),
+            "entry_client_order_id": "m_OL_BTC_1", "signal_reason": STRATEGY_REASON,
+            "candle_open_time_ms": prev_bar[0], "stop_price": D("87000.0"),
+            "trail_distance": D("2000"), "best_price": D("90000"),
+            "stop_client_algo_id": "s_btc_1", "stop_algo_id": 777001, "stop_algo_status": "NEW",
+            "risk_checks": {"initial_stop_price": "87000", "initial_risk_distance": "2000"},
+        }
+        conn.live_positions["ETHUSDT"] = {
+            "symbol": "ETHUSDT", "side": "LONG", "quantity": D("1.0"), "entry_price": D("210"),
+            "entry_client_order_id": "m_OL_ETH_1", "signal_reason": STRATEGY_REASON,
+            "candle_open_time_ms": prev_bar[0], "stop_price": D("200.0"),
+            "trail_distance": D("10"), "best_price": D("220"),
+            "stop_client_algo_id": "s_eth_1", "stop_algo_id": 777002, "stop_algo_status": "NEW",
+            "risk_checks": {"initial_stop_price": "204", "initial_risk_distance": "6"},
+        }
+
+        tc = FakeLiveTradeClient()
+        processed = lt.process_cycle(conn, market, FakeReadClient(), OrderExecutor(tc, TsmomParams()))
+        self.assertTrue(processed)
+
+        # Ordine mercato #1 = CLOSE_LONG su BTCUSDT (uscite prima); poi #2 = OPEN_LONG su AVAXUSDT (er10 massimo)
+        market_orders = [(o["action"], o["symbol"]) for o in conn.orders if o["order_kind"] == "MARKET"]
+        self.assertEqual(market_orders[0], ("CLOSE_LONG", "BTCUSDT"))
+        self.assertEqual(market_orders[1], ("OPEN_LONG", "AVAXUSDT"))
+        self.assertEqual(len(market_orders), 2)
+        # Contatori aggiornati: ETHUSDT + AVAXUSDT -> MAX_SAME_SIDE_POSITIONS = 2 blocca SOL/DOGE
+        self.assertEqual(set(conn.live_positions.keys()), {"ETHUSDT", "AVAXUSDT"})
+
+        # Verifica tie-breaker su sym_idx a parita' esatta di er10
+        raw_tie = _make_custom_uptrend_raw_klines(n=221, base_price=100.0, trend_step=3.0, wick=0.2, wobble=0.0)
+        syms_tie = ["XRPUSDT", "LINKUSDT", "DOTUSDT"]
+        pub_tie = FakePublicClient(
+            server_now_ms=raw_tie[-2][6] + 10_000,
+            raw_klines_by_sym={s: list(raw_tie) for s in syms_tie},
+        )
+        m_tie = lt.LiveMarket(symbols=syms_tie, public_client=pub_tie)
+        m_tie.refresh()
+        conn_tie = FakeLiveConn(status="ACTIVE", orders_enabled=True)
+        lt.process_cycle(conn_tie, m_tie, FakeReadClient(), OrderExecutor(FakeLiveTradeClient(), TsmomParams()))
+        self.assertEqual(list(conn_tie.live_positions.keys()), ["XRPUSDT", "LINKUSDT"])
+
+    def test_leverage_supports_combined_exposure_with_2x_equity_cap_without_margin_errors(self):
+        # ATR bassissimo (<0.5% stop) forza tutte e 3 le posizioni sul cap dinamico 2.0*equity ciascuna (~6.0*equity totali)
+        raw_btc = _make_custom_uptrend_raw_klines(n=221, base_price=1000.0, trend_step=3.0, wick=0.1)
+        raw_eth = _make_custom_uptrend_raw_klines(n=221, base_price=1000.0, trend_step=3.0, wick=0.1)
+        # Short da 1300 -> 1165 con step -3.0 e wick 0.1: 1.5*ATR/close ~ 0.41% < 0.5%
+        raw_sol = []
+        p = 1300.0
+        for i in range(221):
+            ot = 1_700_000_000_000 + i * 86_400_000
+            ct = ot + 86_400_000 - 1
+            step = -0.05 if i < 221 - 45 else -3.0
+            o, c = p, p + step
+            raw_sol.append([ot, f"{o:.4f}", f"{max(o, c) + 0.1:.4f}", f"{min(o, c) - 0.1:.4f}", f"{c:.4f}", "1000", ct])
+            p = c
+
+        equity = D("5816.60")
+        syms = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        pub = FakePublicClient(
+            server_now_ms=raw_btc[-2][6] + 10_000,
+            raw_klines_by_sym={"BTCUSDT": raw_btc, "ETHUSDT": raw_eth, "SOLUSDT": raw_sol},
+        )
+        market = lt.LiveMarket(symbols=syms, public_client=pub)
+        market.refresh()
+
+        conn = FakeLiveConn(status="ACTIVE", orders_enabled=True)
+        read_client = FakeReadClient(equity=str(equity), available_balance=str(equity))
+        tc = FakeLiveTradeClient(avg_price_by_symbol={
+            "BTCUSDT": raw_btc[-2][4],
+            "ETHUSDT": raw_eth[-2][4],
+            "SOLUSDT": raw_sol[-2][4],
+        })
+        processed = lt.process_cycle(conn, market, read_client, OrderExecutor(tc, TsmomParams()))
+        self.assertTrue(processed)
+        self.assertEqual(len(conn.live_positions), 3)
+
+        combined_notional = D("0")
+        for sym, pos in conn.live_positions.items():
+            notional = pos["quantity"] * pos["entry_price"]
+            combined_notional += notional
+            # Cap dinamico 2.0 * equity (supera ampiamente il vecchio tetto statico 2000 USDT)
+            self.assertGreater(notional, D("11000"))
+            self.assertLessEqual(notional, equity * D("2.0"))
+        self.assertGreater(combined_notional, equity * D("5.8"))
+        # A 7x il margine combinato resta entro il saldo disponibile senza errori di margine
+        self.assertLess(combined_notional / D(lt.TARGET_LEVERAGE), equity)
+
+        # Verifica protezione margine disponibile residuo insufficiente
+        conn_low_margin = FakeLiveConn(status="ACTIVE", orders_enabled=True)
+        read_low = FakeReadClient(equity=str(equity), available_balance="400.00")
+        lt.process_cycle(conn_low_margin, market, read_low, OrderExecutor(FakeLiveTradeClient(), TsmomParams()))
+        self.assertEqual(conn_low_margin.live_positions, {})
+
+        # Stop molto ampio (~19% da ombre ribassiste ampie) riduce la leva isolata sotto 7x e la ripristina a chiusura
+        raw_hi_vol = []
+        hp = 100.0
+        for i in range(222):
+            ot = 1_700_000_000_000 + i * 86_400_000
+            ct = ot + 86_400_000 - 1
+            if i < 180:
+                o, c, h, l = hp, hp + 0.1, hp + 0.3, hp - 0.1
+            else:
+                o = hp
+                c = hp * 1.03
+                h = c * 1.001
+                l = o * 0.87
+            raw_hi_vol.append([ot, f"{o:.4f}", f"{h:.4f}", f"{l:.4f}", f"{c:.4f}", "1000", ct])
+            hp = c
+        pub_hv = FakePublicClient(
+            server_now_ms=raw_hi_vol[220][6] + 10_000,
+            raw_klines_by_sym={"SOLUSDT": raw_hi_vol[:222]},
+        )
+        m_hv = lt.LiveMarket(symbols=["SOLUSDT"], public_client=pub_hv)
+        m_hv.refresh()
+        conn_hv = FakeLiveConn(status="ACTIVE", orders_enabled=True)
+        tc_hv = FakeLiveTradeClient(avg_price_by_symbol={"SOLUSDT": raw_hi_vol[220][4]})
+        lt.process_cycle(conn_hv, m_hv, FakeReadClient(equity="5816.60"), OrderExecutor(tc_hv, TsmomParams()))
+        sol_pos = conn_hv.live_positions["SOLUSDT"]
+        self.assertLess(sol_pos["risk_checks"]["leverage"], lt.TARGET_LEVERAGE)
+        lev_calls = [int(p["leverage"]) for _m, path, p in tc_hv.requests if path == "/fapi/v1/leverage"]
+        self.assertIn(sol_pos["risk_checks"]["leverage"], lev_calls)
+
+        # Chiusura successiva ripristina la leva standard TARGET_LEVERAGE (7)
+        exit_bar = [
+            raw_hi_vol[221][0], raw_hi_vol[221][1], raw_hi_vol[221][2],
+            f"{sol_pos['stop_price'] - D('5'):.4f}", f"{sol_pos['stop_price'] - D('2'):.4f}",
+            "1000", raw_hi_vol[221][6],
+        ]
+        open_next = [exit_bar[0] + 86_400_000, "10", "10", "10", "10", "1000", exit_bar[6] + 86_400_000]
+        pub_hv2 = FakePublicClient(
+            server_now_ms=exit_bar[6] + 10_000,
+            raw_klines_by_sym={"SOLUSDT": raw_hi_vol[:221] + [exit_bar, open_next]},
+        )
+        m_hv2 = lt.LiveMarket(symbols=["SOLUSDT"], public_client=pub_hv2)
+        m_hv2.refresh()
+        lt.process_cycle(conn_hv, m_hv2, FakeReadClient(equity="5816.60"), OrderExecutor(tc_hv, TsmomParams()))
+        self.assertEqual(conn_hv.live_positions, {})
+        self.assertEqual(int([p["leverage"] for _m, path, p in tc_hv.requests if path == "/fapi/v1/leverage"][-1]), lt.TARGET_LEVERAGE)
 
 
 if __name__ == "__main__":

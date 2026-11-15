@@ -1,9 +1,10 @@
 import unittest
 from decimal import Decimal as D
 from binance_public import MarketFilters
-from risk_checks import (Action, RiskLimits, RiskViolation, plan_actions,
-                         size_open_quantity, size_open_quantity_atr,
-                         validate_close, validate_open)
+from risk_checks import (Action, RiskLimits, RiskViolation, effective_limits,
+                         plan_actions, safe_leverage_for_stop, size_open_quantity,
+                         size_open_quantity_atr, validate_close,
+                         validate_leverage_for_exposure, validate_open)
 from strategy import Signal
 
 F = MarketFilters(D("0.1"), D("0.001"), D("0.001"), D("120"), D("100"))
@@ -68,6 +69,42 @@ class TestRisk(unittest.TestCase):
 
         with self.assertRaises(RiskViolation):
             validate_open(D("600"), D("0.20"), doge_f, limits, 3, D("0"))
+
+    def test_v2_dynamic_notional_cap_same_side_and_leverage_exposure(self):
+        doge_f = MarketFilters(D("0.00001"), D("1"), D("1"), D("10000000"), D("5"))
+        limits = RiskLimits(
+            max_notional_usdt=D("20000"),
+            max_open_positions=3,
+            max_daily_loss_usdt=D("250"),
+            enforce_btc_qty_cap=False,
+            max_notional_equity_mult=D("2.0"),
+            max_same_side_positions=2,
+        )
+        eff = effective_limits(D("5000"), limits)
+        self.assertEqual(eff.max_notional_usdt, D("10000.0"))
+
+        # Stop stretto (0.002 su price=1 -> 0.2%): risk_usdt=50 -> 25000 qty, cappato a 2.0*5000 = 10000 qty
+        q_capped = size_open_quantity_atr(D("5000"), D("0.01"), D("0.002"), D("1"), doge_f, limits)
+        self.assertEqual(q_capped, D("10000"))
+
+        # Leva 2..6 non basta per 3 * 2.0 * equity * 1.10; 7 passa
+        for bad_lev in (2, 5, 6):
+            with self.assertRaises(RiskViolation):
+                validate_leverage_for_exposure(bad_lev, limits)
+        lev_info = validate_leverage_for_exposure(7, limits)
+        self.assertEqual(lev_info["min_required_leverage"], 7)
+
+        # Limite per direzione = 2
+        with self.assertRaises(RiskViolation):
+            validate_open(D("100"), D("1"), doge_f, eff, 2, D("0"), same_side_open_positions=2, side="LONG")
+
+        # Guardia margine disponibile evita -2019
+        with self.assertRaises(RiskViolation):
+            validate_open(D("5000"), D("1"), doge_f, eff, 1, D("0"), available_margin_usdt=D("500"), leverage=7)
+
+        # Safe leverage per stop molto ampio (> 10.7%) riduce sotto 7x per protezione liquidazione isolata
+        self.assertEqual(safe_leverage_for_stop(D("0.05"), D("1"), 7), 7)
+        self.assertEqual(safe_leverage_for_stop(D("0.20"), D("1"), 7), 3)
 
 
 if __name__ == "__main__":

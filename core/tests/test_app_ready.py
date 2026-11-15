@@ -53,7 +53,7 @@ class TestBaselineAndReady(unittest.TestCase):
 
     def test_check_binance_account_validates_all_12_symbols_isolated_leverage(self):
         sym_configs = [
-            {"symbol": s, "marginType": "ISOLATED", "leverage": 2}
+            {"symbol": s, "marginType": "ISOLATED", "leverage": 7}
             for s in UNIVERSE_SYMBOLS
         ]
         res_ok = cba.evaluate_account_snapshot(
@@ -63,11 +63,25 @@ class TestBaselineAndReady(unittest.TestCase):
             positions=[],
             open_orders=[],
             algo_orders=[],
-            target_leverage=2,
+            target_leverage=7,
         )
         self.assertTrue(res_ok["passed"])
         self.assertEqual(res_ok["checks"]["all_symbols_isolated"], True)
         self.assertEqual(res_ok["checks"]["all_symbols_target_leverage"], True)
+        self.assertEqual(res_ok["checks"]["leverage_supports_combined_exposure"], True)
+
+        # Leva 2x insufficiente per esposizione combinata V2 (3 * 2.0 * equity = 6.0x)
+        res_low_lev = cba.evaluate_account_snapshot(
+            account_data={"totalMarginBalance": "5816.60", "availableBalance": "5816.60"},
+            dual_data={"dualSidePosition": False},
+            sym_configs=[{"symbol": s, "marginType": "ISOLATED", "leverage": 2} for s in UNIVERSE_SYMBOLS],
+            positions=[],
+            open_orders=[],
+            algo_orders=[],
+            target_leverage=2,
+        )
+        self.assertFalse(res_low_lev["passed"])
+        self.assertFalse(res_low_lev["checks"]["leverage_supports_combined_exposure"])
 
         sym_configs[1]["marginType"] = "CROSSED"
         sym_configs[2]["leverage"] = 20
@@ -78,7 +92,7 @@ class TestBaselineAndReady(unittest.TestCase):
             positions=[],
             open_orders=[],
             algo_orders=[],
-            target_leverage=2,
+            target_leverage=7,
         )
         self.assertFalse(res_bad["passed"])
         self.assertIn(UNIVERSE_SYMBOLS[1], res_bad["non_isolated_symbols"])

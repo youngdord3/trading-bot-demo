@@ -116,6 +116,7 @@ class TestStrategy(unittest.TestCase):
         res = evaluate_tsmom_erf(candles, neutral_funding)
         self.assertEqual(res.signal, Signal.BUY)
         self.assertGreater(res.atr14, D("0"))
+        self.assertGreaterEqual(res.er10, D("0.30"))
 
         crowded_last = [(candles[-1].open_time_ms, D("0.00030"))]
         self.assertEqual(evaluate_tsmom_erf(candles, crowded_last).signal, Signal.HOLD)
@@ -146,16 +147,17 @@ class TestStrategy(unittest.TestCase):
         slip = D("0.0004")
         state = initial_trailing_state("LONG", D("100"), D("4"), TsmomParams())
         self.assertEqual(state.stop_price, D("94"))   # 100 - 1.5*4
-        self.assertEqual(state.trail_distance, D("8"))  # 2.0*4
+        self.assertEqual(state.trail_distance, D("9"))  # 2.25*4
+        self.assertEqual(state.initial_risk_distance, D("6"))
 
         bars = [
-            Candle(1, 2, D("100"), D("106"), D("108"), D("99")),  # best=108 -> stop=100
-            Candle(2, 3, D("106"), D("112"), D("115"), D("105")), # best=115 -> stop=107 (> entry)
-            Candle(3, 4, D("112"), D("110"), D("113"), D("109")), # pullback, low=109 > 107 -> no exit
+            Candle(1, 2, D("100"), D("106"), D("108"), D("99")),   # best=108 (1.33R < 2.5R) -> stop=99
+            Candle(2, 3, D("106"), D("112"), D("115"), D("105")),  # best=115 (2.5R -> 0.80x) -> stop=107.8
+            Candle(3, 4, D("112"), D("110"), D("113"), D("109")),  # pullback, low=109 > 107.8 -> stop invariato
         ]
         replayed = replay_trailing_state(state, bars)
         self.assertEqual(replayed.best_price, D("115"))
-        self.assertEqual(replayed.stop_price, D("107"))
+        self.assertEqual(replayed.stop_price, D("107.8"))
 
         gap_down = Candle(4, 5, D("104"), D("103"), D("105"), D("102"))
         exit_hit = check_bar_exit(replayed, gap_down, slip)
@@ -167,10 +169,35 @@ class TestStrategy(unittest.TestCase):
         short_state = initial_trailing_state("SHORT", D("200"), D("4"), TsmomParams())
         self.assertEqual(short_state.stop_price, D("206"))
         short_adv = advance_trailing(short_state, Candle(1, 2, D("198"), D("185"), D("199"), D("184")))
-        self.assertEqual(short_adv.stop_price, D("192"))
+        # best=184 -> +2.667R >= 2.5R -> dist = 9 * 0.80 = 7.2 -> stop = 191.2
+        self.assertEqual(short_adv.stop_price, D("191.2"))
         gap_up = Candle(2, 3, D("195"), D("196"), D("197"), D("194"))
         s_exit = check_bar_exit(short_adv, gap_up, slip)
         self.assertEqual(s_exit, (D("195") * (D("1") + slip), "TRAIL"))
+
+    def test_profit_ratchet_thresholds_2_5R_4_0R_and_never_widens(self):
+        params = TsmomParams()
+        state = initial_trailing_state("LONG", D("100"), D("4"), params)  # 1R=6, trail=9
+        # +2.33R (< 2.5R): trail pieno 9
+        s1 = advance_trailing(state, Candle(1, 2, D("100"), D("112"), D("114"), D("99")), params)
+        self.assertEqual(s1.stop_price, D("105"))
+        # +2.5R (=15/6): ratchet 0.80x (7.2) -> 115 - 7.2 = 107.8
+        s2 = advance_trailing(s1, Candle(2, 3, D("112"), D("113"), D("115"), D("108")), params)
+        self.assertEqual(s2.stop_price, D("107.8"))
+        # Pullback con high minore (112): best rimane 115, stop non arretra
+        s3 = advance_trailing(s2, Candle(3, 4, D("113"), D("110"), D("112"), D("108.5")), params)
+        self.assertEqual(s3.best_price, D("115"))
+        self.assertEqual(s3.stop_price, D("107.8"))
+        # +4.0R (=24/6): ratchet 0.60x (5.4) -> 124 - 5.4 = 118.6
+        s4 = advance_trailing(s3, Candle(4, 5, D("110"), D("123"), D("124"), D("109")), params)
+        self.assertEqual(s4.stop_price, D("118.6"))
+
+        # SHORT +4.0R (=24/6 -> best=176): stop = 176 + 5.4 = 181.4 e non si allarga
+        sh = initial_trailing_state("SHORT", D("200"), D("4"), params)
+        sh_4r = advance_trailing(sh, Candle(1, 2, D("199"), D("177"), D("200"), D("176")), params)
+        self.assertEqual(sh_4r.stop_price, D("181.4"))
+        sh_pullback = advance_trailing(sh_4r, Candle(2, 3, D("178"), D("180"), D("181"), D("178")), params)
+        self.assertEqual(sh_pullback.stop_price, D("181.4"))
 
 
 if __name__ == "__main__":

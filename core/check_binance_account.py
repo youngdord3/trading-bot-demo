@@ -6,9 +6,18 @@ from decimal import Decimal, InvalidOperation
 
 from app import read_database_status
 from binance_private import PrivateReadError, ReadOnlyClient
+from risk_checks import RiskLimits, RiskViolation, validate_leverage_for_exposure
 from strategy import UNIVERSE_SYMBOLS
 
-TARGET_LEVERAGE = int(os.environ.get("TARGET_LEVERAGE", "2"))
+TARGET_LEVERAGE = int(os.environ.get("TARGET_LEVERAGE", os.environ.get("TRADE_LEVERAGE", "7")))
+DEFAULT_V2_LIMITS = RiskLimits(
+    max_notional_usdt=Decimal("20000"),
+    max_open_positions=int(os.environ.get("TRADE_MAX_OPEN_POSITIONS", "3")),
+    max_daily_loss_usdt=Decimal("250"),
+    enforce_btc_qty_cap=False,
+    max_notional_equity_mult=Decimal(os.environ.get("TRADE_MAX_NOTIONAL_EQUITY_MULT", "2.0")),
+    max_same_side_positions=int(os.environ.get("TRADE_MAX_SAME_SIDE_POSITIONS", "2")),
+)
 
 
 class CheckFailed(Exception):
@@ -63,11 +72,18 @@ def evaluate_account_snapshot(
         if isinstance(p, dict) and parse_decimal(p.get("positionAmt", "0")) != 0
     ]
 
+    leverage_exposure_ok = True
+    try:
+        validate_leverage_for_exposure(target_leverage, DEFAULT_V2_LIMITS)
+    except RiskViolation:
+        leverage_exposure_ok = False
+
     checks = {
         "database_baseline_ok": True,
         "one_way_mode": one_way_mode,
         "all_symbols_isolated": len(non_isolated) == 0,
         "all_symbols_target_leverage": len(wrong_leverage) == 0,
+        "leverage_supports_combined_exposure": leverage_exposure_ok,
         "no_open_positions": len(open_positions) == 0,
         "no_open_orders": len(open_orders) == 0,
         "no_open_algo_orders": len(algo_orders) == 0,

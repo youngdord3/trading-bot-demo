@@ -39,7 +39,11 @@ class TsmomParams(NamedTuple):
     ret_long_min: Decimal = Decimal("0.05")
     max_breakout_atr: Decimal = Decimal("1.8")
     sl_atr_mult: Decimal = Decimal("1.5")
-    trail_atr_mult: Decimal = Decimal("2.0")
+    trail_atr_mult: Decimal = Decimal("2.25")
+    ratchet_r1: Decimal = Decimal("2.5")
+    ratchet_mult1: Decimal = Decimal("0.80")
+    ratchet_r2: Decimal = Decimal("4.0")
+    ratchet_mult2: Decimal = Decimal("0.60")
     funding_crowded_long: Decimal = Decimal("0.00030")
     funding_crowded_short: Decimal = Decimal("-0.00010")
     funding_sum3_mult: Decimal = Decimal("2.5")
@@ -51,12 +55,14 @@ class TrailingState(NamedTuple):
     stop_price: Decimal
     trail_distance: Decimal
     best_price: Decimal
+    initial_risk_distance: Decimal = ZERO
 
 
 class StrategyEvaluation(NamedTuple):
     signal: Signal
     atr14: Decimal | None
     reason: str
+    er10: Decimal | None = None
 
 
 def parse_closed_candles(raw: list, server_now_ms: int, interval_ms: int,
@@ -153,7 +159,7 @@ def evaluate_tsmom_erf(
     """Valuta la strategia daily TSMOM + ER10 + Funding Anti-Crowding sull'ultima candela chiusa."""
     min_bars = max(params.ema_slow, params.ret_long + 1, params.adx_period * 2, params.dc_period + 1)
     if len(candles) < min_bars:
-        return StrategyEvaluation(Signal.HOLD, None, "WARMUP")
+        return StrategyEvaluation(Signal.HOLD, None, "WARMUP", None)
 
     highs = [c.high for c in candles]
     lows = [c.low for c in candles]
@@ -165,15 +171,15 @@ def evaluate_tsmom_erf(
     ema50 = ema(closes, params.ema_slow)[-1]
     er10 = efficiency_ratio(closes, params.er_period)[-1]
     if any(v is None for v in (atr14, adx14, ema20, ema50, er10)) or atr14 <= ZERO:
-        return StrategyEvaluation(Signal.HOLD, None, "WARMUP")
+        return StrategyEvaluation(Signal.HOLD, None, "WARMUP", None)
     if adx14 < params.adx_min or er10 < params.er_min:
-        return StrategyEvaluation(Signal.HOLD, atr14, "LOW_TREND_OR_ER")
+        return StrategyEvaluation(Signal.HOLD, atr14, "LOW_TREND_OR_ER", er10)
 
     close = closes[-1]
     prev15 = closes[-1 - params.ret_short]
     prev30 = closes[-1 - params.ret_long]
     if prev15 <= ZERO or prev30 <= ZERO:
-        return StrategyEvaluation(Signal.HOLD, atr14, "INVALID_PRICE")
+        return StrategyEvaluation(Signal.HOLD, atr14, "INVALID_PRICE", er10)
 
     ret15 = (close - prev15) / prev15
     ret30 = (close - prev30) / prev30
@@ -188,13 +194,13 @@ def evaluate_tsmom_erf(
         candidate = (-1, (lower - close) / atr14, Signal.SELL)
 
     if candidate is None:
-        return StrategyEvaluation(Signal.HOLD, atr14, "NO_SIGNAL")
+        return StrategyEvaluation(Signal.HOLD, atr14, "NO_SIGNAL", er10)
     side, breakout_atr, signal = candidate
     if breakout_atr > params.max_breakout_atr:
-        return StrategyEvaluation(Signal.HOLD, atr14, "OVEREXTENDED")
+        return StrategyEvaluation(Signal.HOLD, atr14, "OVEREXTENDED", er10)
     if not _funding_allows(side, funding_points, as_of_ms, params):
-        return StrategyEvaluation(Signal.HOLD, atr14, "FUNDING_CROWDED")
-    return StrategyEvaluation(signal, atr14, STRATEGY_REASON)
+        return StrategyEvaluation(Signal.HOLD, atr14, "FUNDING_CROWDED", er10)
+    return StrategyEvaluation(signal, atr14, STRATEGY_REASON, er10)
 
 
 def initial_trailing_state(
@@ -202,18 +208,27 @@ def initial_trailing_state(
     entry_price: Decimal,
     atr14: Decimal,
     params: TsmomParams = TsmomParams(),
+    initial_stop_price: Decimal | None = None,
 ) -> TrailingState:
-    """Costruisce lo stato iniziale SL + trailing ATR all'apertura di una posizione."""
+    """Costruisce lo stato iniziale SL + trailing ATR (con 1R iniziale) all'apertura di una posizione."""
     if side not in ("LONG", "SHORT"):
         raise ValueError(f"INVALID_SIDE: {side}")
     stop_dist = params.sl_atr_mult * atr14
-    stop_price = entry_price - stop_dist if side == "LONG" else entry_price + stop_dist
+    stop_price = (
+        initial_stop_price
+        if initial_stop_price is not None
+        else (entry_price - stop_dist if side == "LONG" else entry_price + stop_dist)
+    )
+    risk_dist = abs(entry_price - stop_price)
+    if risk_dist <= ZERO:
+        risk_dist = stop_dist
     return TrailingState(
         side=side,
         entry_price=entry_price,
         stop_price=stop_price,
         trail_distance=params.trail_atr_mult * atr14,
         best_price=entry_price,
+        initial_risk_distance=risk_dist,
     )
 
 
@@ -234,27 +249,57 @@ def check_bar_exit(
     return None
 
 
-def advance_trailing(state: TrailingState, candle: Candle) -> TrailingState:
-    """Aggiorna il trailing stop a fine candela per le barre successive."""
+def effective_trail_distance(
+    state: TrailingState,
+    best_price: Decimal,
+    params: TsmomParams = TsmomParams(),
+) -> Decimal:
+    """Applica il profit_ratchet (2.5R -> 0.80x, 4.0R -> 0.60x) rispetto a 1R iniziale."""
+    if state.trail_distance <= ZERO or state.initial_risk_distance <= ZERO:
+        return state.trail_distance
+    favorable = (
+        best_price - state.entry_price
+        if state.side == "LONG"
+        else state.entry_price - best_price
+    )
+    open_r = favorable / state.initial_risk_distance
+    if open_r >= params.ratchet_r2:
+        return state.trail_distance * params.ratchet_mult2
+    if open_r >= params.ratchet_r1:
+        return state.trail_distance * params.ratchet_mult1
+    return state.trail_distance
+
+
+def advance_trailing(
+    state: TrailingState,
+    candle: Candle,
+    params: TsmomParams = TsmomParams(),
+) -> TrailingState:
+    """Aggiorna il trailing stop a fine candela con ratchet su 1R iniziale e vincolo non-allargamento."""
     if state.trail_distance <= ZERO:
         return state
     if state.side == "LONG":
         best = max(state.best_price, candle.high)
-        stop = max(state.stop_price, best - state.trail_distance)
+        eff_distance = effective_trail_distance(state, best, params)
+        stop = max(state.stop_price, best - eff_distance)
         return state._replace(stop_price=stop, best_price=best)
-    best = min(state.best_price, candle.low)
-    stop = min(state.stop_price, best + state.trail_distance)
-    return state._replace(stop_price=stop, best_price=best)
+    if state.side == "SHORT":
+        best = min(state.best_price, candle.low)
+        eff_distance = effective_trail_distance(state, best, params)
+        stop = min(state.stop_price, best + eff_distance)
+        return state._replace(stop_price=stop, best_price=best)
+    raise ValueError(f"INVALID_SIDE: {state.side}")
 
 
 def replay_trailing_state(
     initial_state: TrailingState,
     bars_after_entry: list[Candle],
+    params: TsmomParams = TsmomParams(),
 ) -> TrailingState:
     """Ricostruisce deterministicamente il trailing stop lungo le candele 1d post-entrata."""
     state = initial_state
     for bar in bars_after_entry:
-        state = advance_trailing(state, bar)
+        state = advance_trailing(state, bar, params)
     return state
 
 

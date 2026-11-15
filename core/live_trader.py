@@ -24,8 +24,12 @@ from risk_checks import (
     Action,
     RiskLimits,
     RiskViolation,
+    effective_limits,
+    required_initial_margin_usdt,
+    safe_leverage_for_stop,
     size_open_quantity_atr,
     validate_close,
+    validate_leverage_for_exposure,
     validate_open,
 )
 from strategy import (
@@ -47,13 +51,17 @@ FUNDING_LIMIT = 500
 SLIPPAGE = Decimal("0.0002")
 ENTRY_GRACE_MS = 3_600_000
 RISK_FRACTION = Decimal(os.environ.get("TRADE_RISK_FRACTION", "0.01"))
-TARGET_LEVERAGE = int(os.environ.get("TRADE_LEVERAGE", "2"))
+MAX_NOTIONAL_EQUITY_MULT = Decimal(os.environ.get("TRADE_MAX_NOTIONAL_EQUITY_MULT", "2.0"))
+MAX_SAME_SIDE_POSITIONS = int(os.environ.get("TRADE_MAX_SAME_SIDE_POSITIONS", "2"))
+TARGET_LEVERAGE = int(os.environ.get("TRADE_LEVERAGE", "7"))
 TARGET_MARGIN_TYPE = "ISOLATED"
 LIMITS = RiskLimits(
-    max_notional_usdt=Decimal(os.environ.get("TRADE_MAX_NOTIONAL_USDT", "2000")),
+    max_notional_usdt=Decimal(os.environ.get("TRADE_MAX_NOTIONAL_USDT", "20000")),
     max_open_positions=int(os.environ.get("TRADE_MAX_OPEN_POSITIONS", "3")),
     max_daily_loss_usdt=Decimal(os.environ.get("TRADE_MAX_DAILY_LOSS_USDT", "250")),
     enforce_btc_qty_cap=False,
+    max_notional_equity_mult=MAX_NOTIONAL_EQUITY_MULT,
+    max_same_side_positions=MAX_SAME_SIDE_POSITIONS,
 )
 STRATEGY_PARAMS = TsmomParams()
 
@@ -127,8 +135,15 @@ def ensure_account_preflight(
     trade_client: TradeClient,
     symbols: list[str] | tuple[str, ...],
     target_leverage: int = TARGET_LEVERAGE,
+    limits: RiskLimits = LIMITS,
+    open_symbols: frozenset[str] | set[str] = frozenset(),
 ) -> dict:
-    """Verifica ONE_WAY e applica ISOLATED + leva concordata sui 12 perpetui."""
+    """Verifica leva/esposizione, ONE_WAY e applica ISOLATED + leva concordata sui simboli flat."""
+    try:
+        validate_leverage_for_exposure(target_leverage, limits)
+    except RiskViolation as exc:
+        raise FatalError(str(exc)) from exc
+
     dual = read_client.get("/fapi/v1/positionSide/dual")
     if dual.get("dualSidePosition") is not False:
         raise FatalError("HEDGE_MODE_NOT_SUPPORTED")
@@ -142,6 +157,10 @@ def ensure_account_preflight(
         cfg = cfg_map.get(sym, {})
         cur_margin = str(cfg.get("marginType") or "").upper()
         cur_lev = int(cfg["leverage"]) if cfg.get("leverage") is not None else None
+        if sym in open_symbols:
+            if cur_margin and cur_margin != TARGET_MARGIN_TYPE:
+                raise FatalError(f"OPEN_POSITION_NOT_ISOLATED:{sym}:{cur_margin}")
+            continue
         if cur_margin != TARGET_MARGIN_TYPE:
             trade_client.set_margin_type(sym, TARGET_MARGIN_TYPE)
             margin_updated.append(sym)
@@ -252,11 +271,63 @@ def daily_realized_pnl(conn) -> Decimal:
     return Decimal(str(val or "0"))
 
 
+def _restore_default_leverage(executor: OrderExecutor, sym: str, pos: dict) -> None:
+    """Ripristina la leva standard se ridotta temporaneamente su uno stop ampio."""
+    used_lev = (pos.get("risk_checks") or {}).get("leverage")
+    if used_lev is None or int(used_lev) == TARGET_LEVERAGE:
+        return
+    try:
+        executor.client.set_leverage(sym, TARGET_LEVERAGE)
+    except Exception as exc:
+        emit("LIVE_LEVERAGE_RESTORE_FAILED", symbol=sym, target_leverage=TARGET_LEVERAGE, error=str(exc))
+
+
+def _initial_risk_distance(pos: dict) -> Decimal:
+    """Ricava 1R iniziale da risk_checks senza usare lo stop trailing corrente."""
+    rc = pos.get("risk_checks") or {}
+    raw_risk = rc.get("initial_risk_distance")
+    if raw_risk is not None:
+        val = Decimal(str(raw_risk))
+        if val > ZERO:
+            return val
+    raw_stop = rc.get("initial_stop_price")
+    if raw_stop is not None:
+        val = abs(pos["entry_price"] - Decimal(str(raw_stop)))
+        if val > ZERO:
+            return val
+    return ZERO
+
+
+def direction_counts(open_map: dict[str, dict]) -> dict[str, int]:
+    """Conta le posizioni aperte per direzione ('LONG' e 'SHORT')."""
+    longs = sum(1 for p in open_map.values() if p["side"] == "LONG")
+    shorts = sum(1 for p in open_map.values() if p["side"] == "SHORT")
+    return {"LONG": longs, "SHORT": shorts}
+
+
+def _initial_available_margin(
+    account: dict,
+    equity_usdt: Decimal,
+    open_map: dict[str, dict],
+    target_leverage: int,
+) -> Decimal:
+    raw_avail = account.get("availableBalance")
+    if raw_avail is not None:
+        return Decimal(str(raw_avail))
+    used_margin = ZERO
+    for pos in open_map.values():
+        lev = max(1, int((pos.get("risk_checks") or {}).get("leverage") or target_leverage))
+        used_margin += (pos["quantity"] * pos["entry_price"]) / Decimal(lev)
+    return max(ZERO, equity_usdt - used_margin)
+
+
 def _sync_open_algo_stops(conn, executor: OrderExecutor, open_map: dict[str, dict]) -> dict[str, dict]:
     for sym in list(open_map):
+        pos = open_map[sym]
         res = executor.sync_triggered_algo_stop(conn, sym)
         if res is not None:
             emit("LIVE_ALGO_STOP_SYNCED", symbol=sym, avg_price=res["avg_fill_price"], qty=res["executed_qty"])
+            _restore_default_leverage(executor, sym, pos)
             open_map.pop(sym, None)
     return open_map
 
@@ -286,10 +357,11 @@ def _process_open_symbol_bars(
             stop_price=pos["stop_price"],
             trail_distance=pos["trail_distance"],
             best_price=pos["best_price"],
+            initial_risk_distance=_initial_risk_distance(pos),
         )
         exit_hit = check_bar_exit(state, bar, SLIPPAGE)
         if exit_hit is None:
-            new_state = advance_trailing(state, bar)
+            new_state = advance_trailing(state, bar, STRATEGY_PARAMS)
             rep = executor.replace_stop_algo_order(
                 conn,
                 sym,
@@ -300,6 +372,7 @@ def _process_open_symbol_bars(
             )
             if rep.get("triggered"):
                 open_map.pop(sym, None)
+                _restore_default_leverage(executor, sym, pos)
                 insert_processed_candle(conn, sym, bar.open_time_ms, Signal.HOLD.value, bar.close)
                 processed_any = True
                 return processed_any, pending[idx + 1:]
@@ -326,6 +399,7 @@ def _process_open_symbol_bars(
             risk_checks={"bar_close": str(bar.close), "trail_stop": str(pos["stop_price"])},
         )
         open_map.pop(sym, None)
+        _restore_default_leverage(executor, sym, pos)
         insert_processed_candle(conn, sym, bar.open_time_ms, Signal.HOLD.value, bar.close)
         processed_any = True
         emit("LIVE_EXIT_FILLED", symbol=sym, action=close_action.value, reason=exit_reason,
@@ -335,52 +409,82 @@ def _process_open_symbol_bars(
     return processed_any, []
 
 
-def _process_flat_bar(
+def _record_risk_block(
+    conn,
+    sym: str,
+    bar: Candle,
+    signal: Signal,
+    action: Action,
+    reason: str,
+) -> bool:
+    inserted = insert_processed_candle(conn, sym, bar.open_time_ms, signal.value, bar.close)
+    if inserted:
+        emit("LIVE_RISK_BLOCKED", symbol=sym, candle_open_time_ms=bar.open_time_ms,
+             action=action.value, reason=reason)
+    return inserted
+
+
+def _open_flat_candidate(
     conn,
     market: LiveMarket,
     executor: OrderExecutor,
     sym: str,
-    candles: list[Candle],
-    bar_idx: int,
     bar: Candle,
-    funding: list[tuple[int, Decimal]],
-    server_now: int,
+    eval_res,
     open_map: dict[str, dict],
+    side_counts: dict[str, int],
+    cycle_limits: RiskLimits,
     equity_usdt: Decimal,
     daily_pnl: Decimal,
-) -> bool:
-    if server_now - bar.close_time_ms > ENTRY_GRACE_MS:
-        inserted = insert_processed_candle(conn, sym, bar.open_time_ms, Signal.HOLD.value, bar.close)
-        if inserted:
-            emit("LIVE_CANDLE_STALE_SKIP", symbol=sym, candle_open_time_ms=bar.open_time_ms)
-        return inserted
-
-    eval_res = evaluate_tsmom_erf(candles[:bar_idx + 1], funding, STRATEGY_PARAMS)
-    if eval_res.signal is Signal.HOLD or eval_res.atr14 is None:
-        return insert_processed_candle(conn, sym, bar.open_time_ms, Signal.HOLD.value, bar.close)
-
-    if len(open_map) >= LIMITS.max_open_positions:
-        inserted = insert_processed_candle(conn, sym, bar.open_time_ms, eval_res.signal.value, bar.close)
-        if inserted:
-            emit("LIVE_RISK_BLOCKED", symbol=sym, candle_open_time_ms=bar.open_time_ms,
-                 reason=f"MAX_POSITIONS_REACHED:{len(open_map)}")
-        return inserted
-
+    avail_margin: Decimal,
+) -> tuple[bool, Decimal]:
     action = Action.OPEN_LONG if eval_res.signal is Signal.BUY else Action.OPEN_SHORT
+    side = "LONG" if action is Action.OPEN_LONG else "SHORT"
+
+    if len(open_map) >= cycle_limits.max_open_positions:
+        did = _record_risk_block(conn, sym, bar, eval_res.signal, action,
+                                 f"MAX_POSITIONS_REACHED:{len(open_map)}")
+        return did, avail_margin
+
+    if (
+        cycle_limits.max_same_side_positions is not None
+        and side_counts[side] >= cycle_limits.max_same_side_positions
+    ):
+        did = _record_risk_block(conn, sym, bar, eval_res.signal, action,
+                                 f"MAX_SAME_SIDE_REACHED:{side}:{side_counts[side]}")
+        return did, avail_margin
+
     ref_price = market.client.get_price(sym)
     f = market.filters_by_symbol[sym]
     stop_dist = STRATEGY_PARAMS.sl_atr_mult * eval_res.atr14
+    trade_leverage = safe_leverage_for_stop(stop_dist, ref_price, TARGET_LEVERAGE)
     try:
-        qty = size_open_quantity_atr(equity_usdt, RISK_FRACTION, stop_dist, ref_price, f, LIMITS)
-        checks = validate_open(qty, ref_price, f, LIMITS, len(open_map), daily_pnl)
+        qty = size_open_quantity_atr(equity_usdt, RISK_FRACTION, stop_dist, ref_price, f, cycle_limits)
+        checks = validate_open(
+            qty,
+            ref_price,
+            f,
+            cycle_limits,
+            len(open_map),
+            daily_pnl,
+            same_side_open_positions=side_counts[side],
+            side=side,
+            available_margin_usdt=avail_margin,
+            leverage=trade_leverage,
+        )
     except RiskViolation as exc:
-        inserted = insert_processed_candle(conn, sym, bar.open_time_ms, eval_res.signal.value, bar.close)
-        if inserted:
-            emit("LIVE_RISK_BLOCKED", symbol=sym, candle_open_time_ms=bar.open_time_ms,
-                 action=action.value, reason=str(exc))
-        return inserted
+        return _record_risk_block(conn, sym, bar, eval_res.signal, action, str(exc)), avail_margin
 
     checks["equity_usdt"] = str(equity_usdt)
+    checks["er10"] = str(eval_res.er10) if eval_res.er10 is not None else "0"
+    checks["leverage"] = trade_leverage
+    checks["max_notional_cap_usdt"] = str(cycle_limits.max_notional_usdt)
+
+    leverage_changed = False
+    if trade_leverage != TARGET_LEVERAGE:
+        executor.client.set_leverage(sym, trade_leverage)
+        leverage_changed = True
+
     try:
         executor.execute_open_market(
             conn,
@@ -391,21 +495,30 @@ def _process_flat_bar(
             ref_price=ref_price,
             atr14=eval_res.atr14,
             filters=f,
-            risk_limits=LIMITS,
+            risk_limits=cycle_limits,
             open_positions=len(open_map),
             daily_net_pnl_usdt=daily_pnl,
             signal_reason=STRATEGY_REASON,
             risk_checks=checks,
+            same_side_open_positions=side_counts[side],
+            available_margin_usdt=avail_margin,
+            leverage=trade_leverage,
         )
     except OrderRejectedError as exc:
+        if leverage_changed:
+            _restore_default_leverage(executor, sym, {"risk_checks": {"leverage": trade_leverage}})
         emit("LIVE_ORDER_REJECTED", symbol=sym, action=action.value, error=str(exc))
-        return insert_processed_candle(conn, sym, bar.open_time_ms, eval_res.signal.value, bar.close)
+        return insert_processed_candle(conn, sym, bar.open_time_ms, eval_res.signal.value, bar.close), avail_margin
 
     open_map.update(open_positions_map(conn))
+    side_counts.clear()
+    side_counts.update(direction_counts(open_map))
+    used_margin = required_initial_margin_usdt(qty * ref_price, trade_leverage, Decimal("1.0"))
+    new_avail_margin = max(ZERO, avail_margin - used_margin)
     insert_processed_candle(conn, sym, bar.open_time_ms, eval_res.signal.value, bar.close)
-    emit("LIVE_ENTRY_FILLED", symbol=sym, action=action.value, qty=qty,
-         candle_open_time_ms=bar.open_time_ms, open_positions=len(open_map))
-    return True
+    emit("LIVE_ENTRY_FILLED", symbol=sym, action=action.value, qty=qty, er10=eval_res.er10,
+         leverage=trade_leverage, candle_open_time_ms=bar.open_time_ms, open_positions=len(open_map))
+    return True, new_avail_margin
 
 
 def process_cycle(
@@ -416,7 +529,7 @@ def process_cycle(
     *,
     allow_preflight: bool = True,
 ) -> bool:
-    """Ciclo live singolo: recovery/sync sempre attivo; mutazioni solo in status='ACTIVE' & orders_enabled."""
+    """Ciclo live singolo: sync/open exits prima, poi contatori direzionali e ingressi ordinati (-er10, sym_idx)."""
     executor.recover_pending_orders(conn, market.filters_by_symbol)
     open_map = _sync_open_algo_stops(conn, executor, open_positions_map(conn))
 
@@ -426,7 +539,14 @@ def process_cycle(
         return False
 
     if allow_preflight:
-        ensure_account_preflight(read_client, executor.client, market.symbols, target_leverage=TARGET_LEVERAGE)
+        ensure_account_preflight(
+            read_client,
+            executor.client,
+            market.symbols,
+            target_leverage=TARGET_LEVERAGE,
+            limits=LIMITS,
+            open_symbols=frozenset(open_map),
+        )
 
     for sym, pos in open_map.items():
         if pos["stop_algo_id"] is None:
@@ -462,32 +582,67 @@ def process_cycle(
     if not pending_by_sym:
         return False
 
-    account = read_client.get("/fapi/v3/account")
-    equity_usdt = Decimal(str(account["totalMarginBalance"]))
-    daily_pnl = daily_realized_pnl(conn)
-
+    # Step 1: gestisci prima uscite e trailing sulle posizioni aperte.
     processed_any = False
-    flat_queue: list[tuple[int, int, str, Candle]] = []
+    flat_by_ts: dict[int, list[tuple[int, str, Candle]]] = {}
     for sym_idx, sym in enumerate(market.symbols):
         if sym not in pending_by_sym:
             continue
-        candles, pending, _funding = pending_by_sym[sym]
+        _candles, pending, _funding = pending_by_sym[sym]
         if sym in open_map:
             did_work, pending = _process_open_symbol_bars(conn, market, executor, sym, pending, open_map)
             processed_any = processed_any or did_work
         for bar in pending:
-            flat_queue.append((bar.open_time_ms, sym_idx, sym, bar))
+            flat_by_ts.setdefault(bar.open_time_ms, []).append((sym_idx, sym, bar))
 
-    flat_queue.sort(key=lambda item: (item[0], item[1]))
-    for _open_ms, _sym_idx, sym, bar in flat_queue:
-        if sym in open_map:
-            continue
-        candles, _pending, funding = pending_by_sym[sym]
-        bar_idx = next(idx for idx, c in enumerate(candles) if c.open_time_ms == bar.open_time_ms)
-        did_work = _process_flat_bar(
-            conn, market, executor, sym, candles, bar_idx, bar, funding, server_now, open_map, equity_usdt, daily_pnl
-        )
-        processed_any = processed_any or did_work
+    # Step 2: aggiorna saldo/equity/margine e contatori per direzione dopo eventuali uscite.
+    account = read_client.get("/fapi/v3/account")
+    equity_usdt = Decimal(str(account["totalMarginBalance"]))
+    daily_pnl = daily_realized_pnl(conn)
+    cycle_limits = effective_limits(equity_usdt, LIMITS)
+    side_counts = direction_counts(open_map)
+    avail_margin = _initial_available_margin(account, equity_usdt, open_map, TARGET_LEVERAGE)
+
+    # Step 3: valuta ingressi flat ordinati per (-er10, sym_idx) rispettando MAX_SAME_SIDE_POSITIONS = 2.
+    for open_ms in sorted(flat_by_ts):
+        scored_candidates = []
+        for sym_idx, sym, bar in flat_by_ts[open_ms]:
+            if sym in open_map:
+                continue
+            if server_now - bar.close_time_ms > ENTRY_GRACE_MS:
+                if insert_processed_candle(conn, sym, bar.open_time_ms, Signal.HOLD.value, bar.close):
+                    processed_any = True
+                    emit("LIVE_CANDLE_STALE_SKIP", symbol=sym, candle_open_time_ms=bar.open_time_ms)
+                continue
+            candles, _pending, funding = pending_by_sym[sym]
+            bar_idx = next(idx for idx, c in enumerate(candles) if c.open_time_ms == bar.open_time_ms)
+            eval_res = evaluate_tsmom_erf(candles[:bar_idx + 1], funding, STRATEGY_PARAMS)
+            if eval_res.signal is Signal.HOLD or eval_res.atr14 is None or eval_res.er10 is None:
+                if insert_processed_candle(conn, sym, bar.open_time_ms, Signal.HOLD.value, bar.close):
+                    processed_any = True
+                continue
+            scored_candidates.append((sym_idx, sym, bar, eval_res))
+
+        scored_candidates.sort(key=lambda item: (-item[3].er10, item[0]))
+        side_counts = direction_counts(open_map)
+        for _sym_idx, sym, bar, eval_res in scored_candidates:
+            if sym in open_map:
+                continue
+            did_work, avail_margin = _open_flat_candidate(
+                conn,
+                market,
+                executor,
+                sym,
+                bar,
+                eval_res,
+                open_map,
+                side_counts,
+                cycle_limits,
+                equity_usdt,
+                daily_pnl,
+                avail_margin,
+            )
+            processed_any = processed_any or did_work
 
     return processed_any
 

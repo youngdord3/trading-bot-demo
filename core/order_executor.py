@@ -544,9 +544,14 @@ class OrderExecutor:
             raise TradeAPIError("MISSING_FILL_PRICE")
         trail_state = initial_trailing_state(pos_side, fill_price, atr14, self.params)
         q_stop = quantize_stop_price(pos_side, trail_state.stop_price, tick_size)
+        init_risk_dist = abs(fill_price - q_stop)
+        if init_risk_dist <= ZERO:
+            init_risk_dist = trail_state.initial_risk_distance
 
         enriched_rc = dict(risk_checks or {})
         enriched_rc["atr14"] = format_decimal(atr14)
+        enriched_rc["initial_stop_price"] = format_decimal(q_stop)
+        enriched_rc["initial_risk_distance"] = format_decimal(init_risk_dist)
 
         self._update_order_status(
             conn,
@@ -597,6 +602,8 @@ class OrderExecutor:
             "executed_qty": fill["executed_qty"],
             "avg_fill_price": fill_price,
             "stop_price": q_stop,
+            "initial_stop_price": q_stop,
+            "initial_risk_distance": init_risk_dist,
         }
 
     def _persist_close_fill(
@@ -759,6 +766,9 @@ class OrderExecutor:
         daily_net_pnl_usdt: Decimal,
         signal_reason: str,
         risk_checks: dict | None = None,
+        same_side_open_positions: int | None = None,
+        available_margin_usdt: Decimal | None = None,
+        leverage: int | None = None,
     ) -> dict:
         if action in CLOSING:
             raise RiskViolation("EXPECTED_OPEN_ACTION")
@@ -766,7 +776,19 @@ class OrderExecutor:
         if self._fetch_position(conn, symbol) is not None:
             raise RiskViolation(f"POSITION_ALREADY_OPEN: {symbol}")
 
-        rc = validate_open(qty, ref_price, filters, risk_limits, open_positions, daily_net_pnl_usdt)
+        pos_side = "LONG" if action is Action.OPEN_LONG else "SHORT"
+        rc = validate_open(
+            qty,
+            ref_price,
+            filters,
+            risk_limits,
+            open_positions,
+            daily_net_pnl_usdt,
+            same_side_open_positions=same_side_open_positions,
+            side=pos_side,
+            available_margin_usdt=available_margin_usdt,
+            leverage=leverage,
+        )
         merged_rc = dict(rc)
         if risk_checks:
             merged_rc.update(risk_checks)
