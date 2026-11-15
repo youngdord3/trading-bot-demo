@@ -1,0 +1,93 @@
+services:
+  live-trader:
+    build:
+      context: ./core
+    image: trading-bot-demo-core
+    command: ["python", "-u", "live_trader.py"]
+    restart: on-failure
+    init: true
+    user: "10001:10001"
+
+    environment:
+      DB_HOST: postgres
+      DB_NAME: trading_demo
+      TZ: UTC
+      TRADE_API_KEY_SECRET: binance_api_key
+      TRADE_API_SECRET_SECRET: binance_api_secret
+      TRADE_RISK_FRACTION: "0.01"
+      TRADE_LEVERAGE: "2"
+      TRADE_MAX_NOTIONAL_USDT: "2000"
+      TRADE_MAX_OPEN_POSITIONS: "3"
+      TRADE_MAX_DAILY_LOSS_USDT: "250"
+
+    secrets:
+      - core_trader_db_password
+      - binance_api_key
+      - binance_api_secret
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - backend
+      - exchange_egress
+
+  live-reconciler:
+    build:
+      context: ./core
+    image: trading-bot-demo-core
+    command: ["python", "-u", "reconciler.py"]
+    restart: on-failure
+    init: true
+    user: "10001:10001"
+
+    environment:
+      DB_HOST: postgres
+      DB_NAME: trading_demo
+      TZ: UTC
+      RECONCILER_MODE: loop
+      TRIP_THRESHOLD: "3"
+
+    secrets:
+      - core_reconciler_db_password
+      - binance_api_key
+      - binance_api_secret
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - backend
+      - exchange_egress
+
+secrets:
+  core_trader_db_password:
+    file: ./secrets/core_trader_db_password.txt
+
+networks:
+  exchange_egress:
+    driver: bridge

@@ -15,6 +15,7 @@ RUN groupadd --gid 10001 app \
 COPY --chown=app:app app.py common.py binance_public.py binance_private.py strategy.py risk_checks.py ./
 COPY --chown=app:app check_binance_public.py check_binance_account.py check_reconciler_db.py reconciler.py ./
 COPY --chown=app:app backtest.py indicators.py backtest_advanced.py research_mtf.py research_h1.py research_signals.py research_donchian_validation.py research_730d_regime.py research_paradigms.py research_d1_validation.py research_universe_d1.py paper_trader.py paper_report.py ./
+COPY --chown=app:app order_executor.py live_trader.py ./
 COPY --chown=app:app tests/ ./tests/
 
 USER app

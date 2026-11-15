@@ -71,7 +71,7 @@ def parse_decimal(value):
     except (InvalidOperation, ValueError):
         raise PrivateReadError("UNPARSABLENUMBERS") from None
 
-    if not number.isfinite():
+    if not number.is_finite():
         raise PrivateReadError("UNPARSABLENUMBERS")
 
     return number
@@ -91,6 +91,10 @@ def require_records(value, error_code):
 
 
 requirerecords = require_records
+
+
+STALE_PENDING_SECONDS = 120.0
+OFFSET_TTL_S = 3600.0
 
 
 def observe(client):
@@ -140,12 +144,31 @@ def observe(client):
     equity = parse_decimal(account["totalMarginBalance"])
 
     open_positions_count = 0
+    positions_map = {}
     for position in positions:
         if "positionAmt" not in position:
             raise PrivateReadError("MISSINGPOSITIONAMOUNT")
 
-        if parse_decimal(position["positionAmt"]) != 0:
+        amt = parse_decimal(position["positionAmt"])
+        if amt != 0:
             open_positions_count += 1
+            sym = position.get("symbol")
+            if sym:
+                side = "LONG" if amt > 0 else "SHORT"
+                positions_map[sym] = (side, abs(amt))
+
+    open_orders_symbols = {o.get("symbol") for o in orders if o.get("symbol")}
+    algo_orders_by_symbol = {}
+    for item in algo:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        algo_id_raw = item.get("algoId")
+        algo_orders_by_symbol.setdefault(sym, []).append({
+            "algo_id": int(algo_id_raw) if algo_id_raw is not None else None,
+            "client_algo_id": item.get("clientAlgoId"),
+            "algo_status": str(item.get("algoStatus") or "").upper(),
+        })
 
     return {
         "latency_ms": latency_ms,
@@ -154,23 +177,102 @@ def observe(client):
         "open_orders_count": len(orders),
         "open_algo_orders_count": len(algo),
         "total_equity_usdt": equity,
+        "positions_map": positions_map,
+        "open_orders_symbols": open_orders_symbols,
+        "algo_orders_by_symbol": algo_orders_by_symbol,
     }
 
 
-def evaluate(observation):
-    # Fase pre-operativa: nessuna posizione, nessun ordine,
-    # modalita ONE_WAY. Il saldo DEMO puo essere diverso da zero.
+def read_expected_state(cursor):
+    cursor.execute("SELECT to_regclass('bot.live_positions') IS NOT NULL")
+    row = cursor.fetchone()
+    has_live_tables = bool(row and row[0])
+    if not has_live_tables:
+        return {"has_live_tables": False}
+
+    cursor.execute("""SELECT symbol, side, quantity, stop_algo_id,
+                             stop_client_algo_id, stop_algo_status
+                      FROM bot.live_positions""")
+    positions = {}
+    for sym, side, qty, stop_algo_id, stop_caid, stop_astatus in cursor.fetchall():
+        positions[sym] = {
+            "side": side,
+            "quantity": abs(parse_decimal(qty)),
+            "stop_algo_id": int(stop_algo_id) if stop_algo_id is not None else None,
+            "stop_client_algo_id": stop_caid,
+            "stop_algo_status": stop_astatus,
+        }
+
+    cursor.execute("""SELECT client_order_id, symbol, status,
+                             EXTRACT(EPOCH FROM (now() - updated_at))::double precision
+                      FROM bot.orders
+                      WHERE order_kind = 'MARKET'
+                        AND status IN ('PENDING', 'NEW', 'PARTIALLY_FILLED')""")
+    in_flight_symbols = set()
+    stale_pending_count = 0
+    for _cid, sym, _st, age_s in cursor.fetchall():
+        if age_s is not None and float(age_s) >= STALE_PENDING_SECONDS:
+            stale_pending_count += 1
+        elif sym:
+            in_flight_symbols.add(sym)
+
+    return {
+        "has_live_tables": True,
+        "positions": positions,
+        "in_flight_symbols": in_flight_symbols,
+        "stale_pending_count": stale_pending_count,
+    }
+
+
+def evaluate(observation, expected=None):
+    # Invariante base: solo ONE_WAY mode ammesso.
     if observation["position_mode"] != "ONE_WAY":
         return "UNEXPECTEDHEDGEMODE"
 
-    if observation["open_positions_count"] != 0:
-        return "UNEXPECTEDPOSITIONS"
+    if expected is None or not expected.get("has_live_tables"):
+        if observation["open_positions_count"] != 0:
+            return "UNEXPECTEDPOSITIONS"
 
-    if (
-        observation["open_orders_count"] != 0
-        or observation["open_algo_orders_count"] != 0
-    ):
+        if (
+            observation["open_orders_count"] != 0
+            or observation["open_algo_orders_count"] != 0
+        ):
+            return "UNEXPECTEDORDERS"
+
+        return None
+
+    if expected.get("stale_pending_count", 0) > 0:
+        return "STALEPENDINGORDERS"
+
+    in_flight = set(expected.get("in_flight_symbols", ()))
+    obs_pos = observation.get("positions_map", {})
+    exp_pos = expected.get("positions", {})
+
+    for sym in sorted((set(obs_pos) | set(exp_pos)) - in_flight):
+        obs_entry = obs_pos.get(sym)
+        exp_entry = exp_pos.get(sym)
+        if obs_entry is None or exp_entry is None:
+            return "DESYNCPOSITIONS"
+        if obs_entry[0] != exp_entry["side"] or abs(obs_entry[1] - exp_entry["quantity"]) > Decimal("0"):
+            return "DESYNCPOSITIONS"
+
+    obs_order_syms = set(observation.get("open_orders_symbols", ()))
+    if (obs_order_syms - in_flight) or (observation["open_orders_count"] != 0 and not in_flight):
         return "UNEXPECTEDORDERS"
+
+    obs_algo = observation.get("algo_orders_by_symbol", {})
+    for sym in sorted((set(obs_algo) | set(exp_pos)) - in_flight):
+        sym_algos = obs_algo.get(sym, [])
+        exp_entry = exp_pos.get(sym)
+        if exp_entry is None:
+            if sym_algos:
+                return "DESYNCALGOORDERS"
+            continue
+        expected_algo_id = exp_entry.get("stop_algo_id")
+        if expected_algo_id is None:
+            return "DESYNCALGOORDERS"
+        if len(sym_algos) != 1 or sym_algos[0].get("algo_id") != expected_algo_id:
+            return "DESYNCALGOORDERS"
 
     return None
 
@@ -258,7 +360,9 @@ def cycle(client, connection, consecutive, threshold):
 
     try:
         observation = observe(client)
-        code = evaluate(observation)
+        with connection.cursor() as cursor:
+            expected = read_expected_state(cursor)
+        code = evaluate(observation, expected)
     except PrivateReadError as error:
         code = to_code(error)
 
@@ -312,9 +416,18 @@ def main():
 
     client = ReadOnlyClient()
     consecutive = 0
+    offset_at = None
 
     with db_connect() as connection:
         while True:
+            now_mono = time.monotonic()
+            if offset_at is None or now_mono - offset_at >= OFFSET_TTL_S:
+                try:
+                    client.sync_time_offset()
+                    offset_at = now_mono
+                except PrivateReadError:
+                    pass
+
             consecutive, output = cycle(
                 client, connection, consecutive, threshold
             )

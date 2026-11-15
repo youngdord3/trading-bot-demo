@@ -22,6 +22,7 @@ from risk_checks import (
 )
 from strategy import (
     STRATEGY_REASON,
+    UNIVERSE_SYMBOLS,
     Candle,
     Signal,
     TrailingState,
@@ -35,10 +36,6 @@ from strategy import (
     replay_trailing_state,
 )
 
-UNIVERSE_SYMBOLS = (
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT", "XRPUSDT",
-    "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT", "BCHUSDT",
-)
 INTERVAL, INTERVAL_MS = "1d", 86_400_000
 WINDOW = 220                  # 220 candele 1d (~7 mesi): copre warmup EMA50/ADX14/Ret30
 FUNDING_LIMIT = 500           # ~166 giorni di funding 8h per gate anti-crowding + cashflow

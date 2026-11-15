@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from psycopg.rows import dict_row
 
 from binance_private import PrivateReadError, ReadOnlyClient
 
+
+@lru_cache(maxsize=8)
 def read_secret(name: str) -> str:
     value = Path(f"/run/secrets/{name}").read_text(
         encoding="utf-8"
@@ -21,12 +24,54 @@ def read_secret(name: str) -> str:
 
     return value
 
-DB_PASSWORD = read_secret("core_db_password")
-API_TOKEN = read_secret("core_api_token")
 
 DB_HOST = os.environ.get("DB_HOST", "postgres")
 DB_NAME = os.environ.get("DB_NAME", "trading_demo")
 DB_USER = "core_reader"
+SUPPORTED_SCHEMA_VERSIONS = (
+    [1, 2, 3, 4, 5],
+    [1, 2, 3, 4, 5, 6],
+)
+
+
+def evaluate_database_status(
+    state: dict | None,
+    migrations: list[int],
+    permissions: dict,
+    db_user: str = DB_USER,
+) -> dict:
+    """Valuta la coerenza dello stato DB e dei privilegi in sola lettura senza I/O."""
+    if state is None:
+        raise RuntimeError("System state missing")
+
+    orders_enabled = bool(state["orders_enabled"])
+    status = state["status"]
+    checks = {
+        "demo_environment": state["environment"] == "DEMO",
+        "valid_status": status in ("PAUSED", "ACTIVE"),
+        "orders_coherence": (not orders_enabled) or (status == "ACTIVE"),
+        "expected_schema": migrations in SUPPORTED_SCHEMA_VERSIONS,
+        "restricted_db_user": permissions["db_user"] == db_user,
+        "read_only_transaction": permissions["transaction_read_only"] == "on",
+        "no_state_update_privilege": permissions["can_update_state"] is False,
+    }
+    ready = all(checks.values())
+    return {
+        "service": "trading-core",
+        "phase": "DATABASE_READ_ONLY",
+        "ready": ready,
+        "database_connected": True,
+        "environment": state["environment"],
+        "status": status,
+        "orders_enabled": orders_enabled,
+        "schema_versions": migrations,
+        "db_user": permissions["db_user"],
+        "checks": checks,
+        "state_updated_at": state["updated_at"].isoformat(),
+        "exchange_connected": False,
+        "trading_ready": bool(ready and status == "ACTIVE" and orders_enabled),
+    }
+
 
 def read_database_status() -> dict:
     with psycopg.connect(
@@ -34,7 +79,7 @@ def read_database_status() -> dict:
         port=5432,
         dbname=DB_NAME,
         user=DB_USER,
-        password=DB_PASSWORD,
+        password=read_secret("core_db_password"),
         connect_timeout=3,
         options="-c statement_timeout=5000",
         row_factory=dict_row,
@@ -80,45 +125,13 @@ def read_database_status() -> dict:
             )
             permissions = cur.fetchone()
 
-    if state is None:
-        raise RuntimeError("System state missing")
-
-    checks = {
-        "demo_environment": state["environment"] == "DEMO",
-        "paused": state["status"] == "PAUSED",
-        "orders_disabled": state["orders_enabled"] is False,
-        "expected_schema": migrations == [1, 2, 3, 4],
-        "restricted_db_user": (
-            permissions["db_user"] == DB_USER
-        ),
-        "read_only_transaction": (
-            permissions["transaction_read_only"] == "on"
-        ),
-        "no_state_update_privilege": (
-            permissions["can_update_state"] is False
-        ),
-    }
-
-    return {
-        "service": "trading-core",
-        "phase": "DATABASE_READ_ONLY",
-        "ready": all(checks.values()),
-        "database_connected": True,
-        "environment": state["environment"],
-        "status": state["status"],
-        "orders_enabled": state["orders_enabled"],
-        "schema_versions": migrations,
-        "db_user": permissions["db_user"],
-        "checks": checks,
-        "state_updated_at": state["updated_at"].isoformat(),
-        "exchange_connected": False,
-        "trading_ready": False,
-    }
+    return evaluate_database_status(state, migrations, permissions, DB_USER)
 
 EXCHANGE_CACHE_TTL_SECONDS = 10.0
 _exchange_lock = threading.Lock()
 _exchange_last_check = 0.0
 _exchange_connected_cached = False
+
 
 def check_exchange_connected() -> bool:
     global _exchange_last_check, _exchange_connected_cached
@@ -130,6 +143,7 @@ def check_exchange_connected() -> bool:
         connected = False
         try:
             client = ReadOnlyClient()
+            client.sync_time_offset()
             data = client.get("/fapi/v3/account")
             if isinstance(data, dict) and "totalMarginBalance" in data:
                 connected = True
@@ -140,13 +154,18 @@ def check_exchange_connected() -> bool:
         _exchange_connected_cached = connected
         return _exchange_connected_cached
 
+
 def read_readiness_status() -> dict:
     payload = read_database_status()
     exchange_connected = check_exchange_connected()
     payload["exchange_connected"] = exchange_connected
     payload["checks"]["exchange_connected"] = exchange_connected
     payload["ready"] = bool(payload["ready"] and exchange_connected)
-    payload["trading_ready"] = False
+    payload["trading_ready"] = bool(
+        payload["ready"]
+        and payload["status"] == "ACTIVE"
+        and payload["orders_enabled"] is True
+    )
     return payload
 
 class Handler(BaseHTTPRequestHandler):
@@ -173,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def authenticated(self) -> bool:
         supplied = self.headers.get("Authorization", "")
-        expected = f"Bearer {API_TOKEN}"
+        expected = f"Bearer {read_secret('core_api_token')}"
 
         return hmac.compare_digest(
             supplied.encode("utf-8"),
